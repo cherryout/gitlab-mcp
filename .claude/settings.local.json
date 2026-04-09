@@ -1,0 +1,56 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit(**/*)",
+      "Write(**/*)",
+      "Read(**/*)",
+      "Bash",
+      "Read(//Users/alexdenisenko/IdeaProjects/**)",
+      "WebSearch",
+      "WebFetch",
+      "SlashCommand"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(git --no-pager push:*)",
+      "Bash(git -c :* push::*)",
+      "Bash(git -C :* push::*)",
+      "Bash(rm :*::*)",
+      "Bash(rmdir:*)",
+      "Bash(rsync:*)",
+      "Bash(truncate:*)",
+      "Bash(fdisk:*)",
+      "Bash(sysctl:*)",
+      "Bash(kill:*)",
+      "Bash(usermod:*)",
+      "Bash(userdel:*)",
+      "Bash(wipefs:*)",
+      "Bash(shutdown:*)",
+      "Bash(reboot:*)",
+      "Bash(halt:*)",
+      "Bash(poweroff:*)"
+    ],
+    "ask": [
+      "Bash(rm:*)",
+      "Bash(rm:*)",
+      "Bash(rm -rf:*)",
+      "Bash(rmdir:*)",
+      "Bash(mv :*::*)",
+      "Bash(cp -f:*)",
+      "Bash(cp -r:*)",
+      "Bash(dd:*)",
+      "Bash(truncate:*)",
+      "Bash(shred:*)",
+      "Bash(chmod:*)",
+      "Bash(chown:*)",
+      "Bash(git push:*)",
+      "Bash(git --no-pager push:*)",
+      "Bash(git -c :* push::*)"
+    ],
+    "defaultMode": "acceptEdits"
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "forgejo"
+  ]
+}
