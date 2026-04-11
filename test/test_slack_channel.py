@@ -76,7 +76,6 @@ async def create_client(
     acl_path: str,
     poll_interval: str = "600000",
     my_username: str = "testuser",
-    alert_channels: str = "alerts",
 ) -> MCPClient:
     db_file = tempfile.mktemp(suffix=".db")
     log_file = tempfile.mktemp(suffix=".log")
@@ -86,7 +85,6 @@ async def create_client(
         "SLACK_CHANNEL_WORKSPACE": "test",
         "SLACK_CHANNEL_POLL_INTERVAL": poll_interval,
         "SLACK_CHANNEL_MY_USERNAME": my_username,
-        "SLACK_CHANNEL_ALERT_CHANNELS": alert_channels,
         "SLACK_CHANNEL_DB_PATH": db_file,
         "SLACK_CHANNEL_LOG_PATH": log_file,
         "SLACK_CHANNEL_LOG_LEVEL": "debug",
@@ -283,10 +281,10 @@ async def test_thread_reply(state_path: str, acl_path: str):
     await client.close()
 
 
-# ─── 6. Alert Channel → alert Event ───────────────────────────────────
+# ─── 6. Alert Channel → message_received ──────────────────────────────
 
-async def test_alert(state_path: str, acl_path: str):
-    print("\n--- 6. Alert Channel → alert Event ---")
+async def test_alert_channel(state_path: str, acl_path: str):
+    print("\n--- 6. Alert Channel → message_received (no special type) ---")
 
     write_state(state_path, [
         {"id": "C099", "name": "alerts"},
@@ -297,7 +295,7 @@ async def test_alert(state_path: str, acl_path: str):
     })
     make_acl(acl_path, ["#alerts"])
 
-    client = await create_client(state_path, acl_path, poll_interval="1000", alert_channels="alerts")
+    client = await create_client(state_path, acl_path, poll_interval="1000")
     await client.initialize(channel=True)
     await collect_notifications(client, duration=3.0)
 
@@ -311,12 +309,12 @@ async def test_alert(state_path: str, acl_path: str):
     })
 
     notifications = await collect_notifications(client, duration=4.0)
-    events = find_events(notifications, "alert")
+    events = find_events(notifications, "message_received")
 
-    assert_true(len(events) >= 1, f"alert event (got {len(events)})")
+    assert_true(len(events) >= 1, f"message_received from alert channel (got {len(events)})")
     if events:
-        assert_true("CPU" in events[0]["params"]["content"], "alert content has message")
-        assert_true(events[0]["params"]["meta"].get("channel_name") == "alerts", "channel is alerts")
+        assert_true("CPU" in events[0]["params"]["content"], "content has alert message")
+        assert_true(events[0]["params"]["meta"].get("channel_name") == "alerts", "channel_name is alerts")
 
     await client.close()
 
@@ -575,7 +573,7 @@ async def main():
     await test_message_received(state_path, acl_path)
     await test_mention(state_path, acl_path)
     await test_thread_reply(state_path, acl_path)
-    await test_alert(state_path, acl_path)
+    await test_alert_channel(state_path, acl_path)
     await test_mentions_only(state_path, acl_path)
     await test_deduplication(state_path, acl_path)
     await test_multiple_channels(state_path, acl_path)

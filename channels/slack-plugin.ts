@@ -137,7 +137,6 @@ export class SlackChannelPlugin implements ChannelPlugin {
     { name: "message_received", description: "New message in a watched channel or DM" },
     { name: "mention", description: "Someone mentioned you (@)" },
     { name: "thread_reply", description: "Reply in a thread you participate in" },
-    { name: "alert", description: "Message in an alert channel (banking_alerts, ops-support)" },
   ];
 
   readonly tools: ToolDef[] = [];
@@ -155,18 +154,12 @@ export class SlackChannelPlugin implements ChannelPlugin {
   private aclChannels!: string[];
   private aclUsers!: string[];
   private mentionsOnlyChannels!: Set<string>;
-  private alertChannels!: Set<string>;
 
   async init(notify: NotifyFn) {
     this.notify = notify;
 
     this.pollIntervalMs = parseInt(process.env.SLACK_CHANNEL_POLL_INTERVAL || "30000", 10);
     this.myUsername = process.env.SLACK_CHANNEL_MY_USERNAME || "oleksandr.denysenko";
-    this.alertChannels = new Set(
-      (process.env.SLACK_CHANNEL_ALERT_CHANNELS || "banking_alerts_int,ops-support,amaiz-notifications-prod")
-        .split(",").map((s) => s.trim()).filter(Boolean),
-    );
-
     const aclPath = process.env.SLACK_MCP_ACL_FILE || join(homedir(), ".config", "slack-mcp", "acl.json");
     const acl = this.loadAcl(aclPath);
     this.aclChannels = acl.channels;
@@ -240,7 +233,6 @@ export class SlackChannelPlugin implements ChannelPlugin {
       aclChannels: this.aclChannels,
       aclUsers: this.aclUsers,
       mentionsOnly: [...this.mentionsOnlyChannels],
-      alertChannels: [...this.alertChannels],
       dbPath,
     }, "slack plugin initialized");
   }
@@ -405,7 +397,6 @@ export class SlackChannelPlugin implements ChannelPlugin {
 
     if (this.mentionsOnlyChannels.has(channel.name) && !isMention) return null;
 
-    if (this.alertChannels.has(channel.name)) return "alert";
     if (isMention) return "mention";
     if (msg.threadTs && msg.threadTs !== msg.ts) return "thread_reply";
 
