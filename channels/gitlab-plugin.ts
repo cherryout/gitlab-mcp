@@ -132,8 +132,8 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     this.apiUrl = process.env.GITLAB_API_URL || "https://gitlab.com/api/v4";
     this.token = process.env.GITLAB_PERSONAL_ACCESS_TOKEN!;
     this.pollIntervalMs = parseInt(process.env.GITLAB_CHANNEL_POLL_INTERVAL || "30000", 10);
-    this.watchPollMs = 10_000;
-    this.watchTimeoutMs = 30 * 60 * 1000;
+    this.watchPollMs = parseInt(process.env.GITLAB_CHANNEL_WATCH_POLL || "10000", 10);
+    this.watchTimeoutMs = parseInt(process.env.GITLAB_CHANNEL_WATCH_TIMEOUT || String(30 * 60 * 1000), 10);
     this.namespaceFilter = process.env.GITLAB_CHANNEL_NAMESPACE || "";
 
     this.headers = {
@@ -219,6 +219,9 @@ export class GitLabChannelPlugin implements ChannelPlugin {
       const { project_id, mr_iid, issue_iid, text } = args as {
         project_id: string; mr_iid?: string; issue_iid?: string; text: string;
       };
+      if (!mr_iid && !issue_iid) {
+        throw new Error("Either mr_iid or issue_iid is required");
+      }
       const entity = mr_iid ? `merge_requests/${mr_iid}` : `issues/${issue_iid}`;
       const url = `${this.apiUrl}/projects/${encodeURIComponent(project_id)}/${entity}/notes`;
       const res = await nodeFetch(url, { method: "POST", headers: this.headers, body: JSON.stringify({ body: text }) });

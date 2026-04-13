@@ -8,7 +8,9 @@
       "Read(//Users/alexdenisenko/IdeaProjects/**)",
       "WebSearch",
       "WebFetch",
-      "SlashCommand"
+      "SlashCommand",
+      "mcp__jenkins-int__search_jobs",
+      "mcp__jenkins-int__get_all_jobs"
     ],
     "deny": [
       "Bash(git push:*)",

@@ -25,6 +25,10 @@ const PLUGIN_MAP: Record<string, () => Promise<ChannelPlugin>> = {
     const { SlackChannelPlugin } = await import("./channels/slack-plugin.js");
     return new SlackChannelPlugin();
   },
+  jenkins: async () => {
+    const { JenkinsChannelPlugin } = await import("./channels/jenkins-plugin.js");
+    return new JenkinsChannelPlugin();
+  },
 };
 
 const LOG_DIR = join(homedir(), ".cache", "channel-hub");

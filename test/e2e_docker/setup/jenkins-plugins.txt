@@ -1,0 +1,4 @@
+workflow-aggregator:latest
+git:latest
+pipeline-stage-view:latest
+cloudbees-folder:latest
