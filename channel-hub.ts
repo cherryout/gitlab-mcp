@@ -54,6 +54,11 @@ logger.info({ plugins: pluginNames, autoStart }, "channel-hub starting");
 
 const orchestrator = new Orchestrator({ logger });
 
+const SESSION_OWNER = process.env.CHANNEL_HUB_SESSION_OWNER || "default";
+const SESSION_ROLE = process.env.CHANNEL_HUB_SESSION_ROLE || "main";
+let activeSessionId: string | null = null;
+let activeRuntimeId: string | null = null;
+
 // ─── Plugin State ─────────────────────────────────────────────────────
 
 interface PluginEntry {
@@ -142,6 +147,17 @@ Hub tools:
 - hub_subscribe: activate a plugin to start receiving events
 - hub_unsubscribe: deactivate a plugin
 - hub_status: show all plugins and their status
+
+Orchestrator tools (session & watch management):
+- add_watch: watch an entity (pipeline, MR, thread) — matching events route to your session
+- remove_watch / list_watches: manage watches
+- list_session_feed: see attention items routed to this session
+- list_pending_deliveries / get_delivery_summary: see queued events
+- ack_attention / snooze_attention / resolve_attention: manage attention lifecycle
+- get_session_state: full session state dump
+- list_unmatched_events: events that matched no watch
+
+Session is auto-managed: created on first startup, resumed on reconnect. Watches survive session restarts.
 
 Plugin tools are available once the plugin is subscribed.
 ${pluginList.map((p) => `[${p.name}]\n  events: ${p.eventTypes.map((e) => e.name).join(", ")}\n  tools: ${p.tools.map((t) => t.name).join(", ")}`).join("\n")}`,
@@ -325,9 +341,39 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 await mcp.connect(new StdioServerTransport());
 logger.info("MCP connected via stdio");
 
+// ─── Session Auto-Management ─────────────────────────────────────────
+
+const { session, resumed } = orchestrator.findOrCreateSession(SESSION_OWNER, {
+  session_name: `hub-${SESSION_ROLE}`,
+  role: SESSION_ROLE,
+});
+activeSessionId = session.session_id;
+logger.info({ sessionId: activeSessionId, resumed }, "orchestrator session ready");
+
+const runtime = orchestrator.attachRuntime(activeSessionId, undefined, "stdio");
+activeRuntimeId = runtime.runtime_id;
+logger.info({ runtimeId: activeRuntimeId }, "runtime attached");
+
+if (resumed) {
+  const pending = orchestrator.listPendingDeliveries(activeSessionId);
+  if (pending.length > 0) {
+    logger.info({ pending: pending.length }, "replaying pending deliveries");
+    await orchestrator.replayOnResume(activeSessionId, async (content, meta) => {
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: { content, meta },
+      });
+    });
+  }
+}
+
 const maintenanceTimer = setInterval(() => {
   orchestrator.expireStaleWatches();
   orchestrator.expireStaleDeliveries();
+  orchestrator.detachStaleRuntimes();
+  if (activeRuntimeId) {
+    orchestrator.heartbeat(activeRuntimeId);
+  }
 }, 60_000);
 
 if (autoStart) {
@@ -341,6 +387,10 @@ if (autoStart) {
 const shutdown = async () => {
   logger.info("shutting down");
   clearInterval(maintenanceTimer);
+  if (activeSessionId) {
+    orchestrator.markSessionResumable(activeSessionId);
+    logger.info({ sessionId: activeSessionId }, "session marked resumable for next startup");
+  }
   for (const [, entry] of registry) {
     if (!entry.active) continue;
     try {

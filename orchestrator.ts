@@ -99,6 +99,24 @@ export class Orchestrator {
     return this.stmts.getSession.get(sessionId) as SessionRow;
   }
 
+  findOrCreateSession(owner: string, opts?: Omit<RegisterSessionParams, "owner">): { session: SessionRow; resumed: boolean } {
+    const existing = this.stmts.findResumableSession.get(owner) as SessionRow | undefined;
+    if (existing) {
+      const now = Date.now();
+      this.stmts.detachAllRuntimes.run(existing.session_id);
+      this.stmts.updateSessionStatus.run("active", now, existing.session_id);
+      this.stmts.updateSessionLastSeen.run(now, existing.session_id);
+      this.logger.info({ sessionId: existing.session_id, owner }, "session resumed");
+      return { session: this.stmts.getSession.get(existing.session_id) as SessionRow, resumed: true };
+    }
+    const session = this.registerSession({ ...opts, owner });
+    return { session, resumed: false };
+  }
+
+  listSessions(): SessionRow[] {
+    return this.stmts.listSessions.all() as SessionRow[];
+  }
+
   closeSession(sessionId: string): void {
     const session = this.stmts.getSession.get(sessionId) as SessionRow | undefined;
     if (!session) throw new Error(`Session not found: ${sessionId}`);
@@ -145,6 +163,22 @@ export class Orchestrator {
   detachRuntime(runtimeId: string): void {
     this.stmts.detachRuntime.run(runtimeId);
     this.logger.info({ runtimeId }, "runtime detached");
+  }
+
+  markSessionResumable(sessionId: string): void {
+    const now = Date.now();
+    this.stmts.detachAllRuntimes.run(sessionId);
+    this.stmts.updateSessionStatus.run("resumable", now, sessionId);
+    this.logger.info({ sessionId }, "session marked resumable");
+  }
+
+  detachStaleRuntimes(staleThresholdMs: number = 120_000): number {
+    const cutoff = Date.now() - staleThresholdMs;
+    const result = this.stmts.detachStaleRuntimes.run(cutoff);
+    if (result.changes > 0) {
+      this.logger.info({ detached: result.changes, staleThresholdMs }, "stale runtimes detached");
+    }
+    return result.changes;
   }
 
   heartbeat(runtimeId: string): void {

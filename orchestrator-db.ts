@@ -216,10 +216,13 @@ export interface OrchestratorStmts {
   updateSessionStatus: Database.Statement;
   updateSessionLastSeen: Database.Statement;
   listSessions: Database.Statement;
+  findResumableSession: Database.Statement;
 
   insertRuntime: Database.Statement;
   getActiveRuntime: Database.Statement;
   detachRuntime: Database.Statement;
+  detachAllRuntimes: Database.Statement;
+  detachStaleRuntimes: Database.Statement;
   updateHeartbeat: Database.Statement;
 
   insertWatch: Database.Statement;
@@ -277,6 +280,9 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
     updateSessionStatus: db.prepare("UPDATE sessions SET status = ?, last_seen_at = ? WHERE session_id = ?"),
     updateSessionLastSeen: db.prepare("UPDATE sessions SET last_seen_at = ? WHERE session_id = ?"),
     listSessions: db.prepare("SELECT * FROM sessions WHERE status IN ('active', 'resumable') ORDER BY last_seen_at DESC"),
+    findResumableSession: db.prepare("SELECT * FROM sessions WHERE owner = ? AND status = 'resumable' ORDER BY last_seen_at DESC LIMIT 1"),
+    detachAllRuntimes: db.prepare("UPDATE runtime_attachments SET attached = 0 WHERE session_id = ? AND attached = 1"),
+    detachStaleRuntimes: db.prepare("UPDATE runtime_attachments SET attached = 0 WHERE attached = 1 AND last_heartbeat_at < ?"),
 
     insertRuntime: db.prepare(`
       INSERT INTO runtime_attachments (runtime_id, session_id, channel_name, attached, started_at, last_heartbeat_at, runtime_metadata_json)

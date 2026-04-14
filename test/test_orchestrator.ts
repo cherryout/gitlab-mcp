@@ -231,6 +231,97 @@ async function run() {
 
   orchestrator.close();
 
+  // ─── Phase 2 Tests ──────────────────────────────────────────────────
+
+  console.log("\n--- Phase 2: findOrCreateSession (new) ---");
+  const orch2 = new Orchestrator({ dbPath });
+  const { session: s3, resumed: r3 } = orch2.findOrCreateSession("testuser", { role: "bugfix" });
+  assert(!!s3.session_id, "new session created");
+  assert(!r3, "not a resume");
+  assert(s3.owner === "testuser", "owner is testuser");
+  assert(s3.role === "bugfix", "role is bugfix");
+
+  console.log("\n--- Phase 2: findOrCreateSession (resume) ---");
+  orch2.markSessionResumable(s3.session_id);
+  const stateAfterMark = orch2.getSessionState(s3.session_id);
+  assert(stateAfterMark.session.status === "resumable", "session marked resumable");
+
+  const { session: s4, resumed: r4 } = orch2.findOrCreateSession("testuser");
+  assert(s4.session_id === s3.session_id, "same session resumed");
+  assert(r4, "is a resume");
+  assert(s4.status === "active", "status back to active");
+
+  console.log("\n--- Phase 2: watches survive resume ---");
+  const w2 = orch2.addWatch({
+    session_id: s4.session_id,
+    watch_type: "merge-request",
+    entity_type: "merge_request",
+    entity_ref: "gitlab:proj:mr:42",
+    correlation_key: "gitlab:proj:mr:42",
+  });
+  orch2.attachRuntime(s4.session_id, undefined, "stdio");
+
+  // Simulate shutdown: mark resumable
+  orch2.markSessionResumable(s4.session_id);
+  const watchesDuringDetach = orch2.listWatches(s4.session_id);
+  assert(watchesDuringDetach.length === 1, "watch survives detach");
+
+  // Simulate event while detached
+  const res2 = orch2.ingestEvent({
+    content: "New comment on MR !42",
+    meta: { event_type: "mr_comment", plugin: "gitlab" },
+    orchestration: {
+      source: "gitlab",
+      event_kind: "mr_comment",
+      entity_type: "merge_request",
+      entity_ref: "gitlab:proj:mr:42",
+      dedup_key: "gitlab:mr:42:comment:999",
+      importance_hint: "normal",
+      title_hint: "New comment on MR !42",
+    },
+  });
+  assert(res2.matchedWatches === 1, "event matched watch while detached");
+  assert(res2.deliveries[0].mode === "queued", "delivery queued while detached");
+
+  // Resume and replay
+  const { session: s5, resumed: r5 } = orch2.findOrCreateSession("testuser");
+  assert(r5, "second resume");
+  const pendingBeforeReplay = orch2.listPendingDeliveries(s5.session_id);
+  assert(pendingBeforeReplay.length === 1, "1 pending delivery on resume");
+
+  const replayed2: string[] = [];
+  await orch2.replayOnResume(s5.session_id, async (content) => {
+    replayed2.push(content);
+  });
+  assert(replayed2.length === 1, "1 item replayed on resume");
+  assert(replayed2[0].includes("[replay") , "replayed content has replay marker");
+
+  const pendingAfterReplay2 = orch2.listPendingDeliveries(s5.session_id);
+  assert(pendingAfterReplay2.length === 0, "no pending after replay");
+
+  console.log("\n--- Phase 2: stale runtime detection ---");
+  const rt2 = orch2.attachRuntime(s5.session_id, undefined, "stdio");
+  // Manually set heartbeat to the past to simulate stale
+  orch2.heartbeat(rt2.runtime_id);
+  // Use a large threshold so the runtime's heartbeat is definitely stale
+  const detachedCount = orch2.detachStaleRuntimes(-1);
+  assert(detachedCount >= 1, "stale runtime detached");
+  const stateAfterStale = orch2.getSessionState(s5.session_id);
+  assert(stateAfterStale.runtime === null, "no active runtime after stale detection");
+
+  console.log("\n--- Phase 2: listSessions ---");
+  const sessions = orch2.listSessions();
+  assert(sessions.length >= 1, "listSessions returns sessions");
+  assert(sessions.some((s) => s.session_id === s5.session_id), "our session in list");
+
+  console.log("\n--- Phase 2: different owner gets new session ---");
+  const { session: s6, resumed: r6 } = orch2.findOrCreateSession("otheruser", { role: "review" });
+  assert(!r6, "different owner gets new session");
+  assert(s6.session_id !== s5.session_id, "different session ID");
+  assert(s6.owner === "otheruser", "correct owner");
+
+  orch2.close();
+
   try { unlinkSync(dbPath); } catch {}
 
   console.log(`\n=======================`);

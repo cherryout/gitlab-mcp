@@ -185,6 +185,14 @@ export function getOrchestratorTools(): ToolDef[] {
         required: ["session_id"],
       },
     },
+    {
+      name: "list_sessions",
+      description: "List all active and resumable sessions",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
   ];
 }
 
@@ -270,6 +278,9 @@ export async function handleOrchestratorToolCall(
 
       case "get_session_state":
         return ok(orchestrator.getSessionState(args.session_id as string));
+
+      case "list_sessions":
+        return ok(orchestrator.listSessions());
 
       default:
         return null;
