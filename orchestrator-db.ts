@@ -3,7 +3,7 @@ import { mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
-const DEFAULT_DB_DIR = join(homedir(), ".cache", "channel-hub");
+const DEFAULT_DB_DIR = join(homedir(), ".cache", "orchestrator");
 const DEFAULT_DB_PATH = join(DEFAULT_DB_DIR, "orchestrator.db");
 
 const SCHEMA = `

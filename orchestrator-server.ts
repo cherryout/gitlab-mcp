@@ -16,6 +16,9 @@ import type {
   ToolDef,
 } from "./channel-plugin.js";
 import { Orchestrator } from "./orchestrator.js";
+import { getOrchestratorTools, handleOrchestratorToolCall } from "./orchestrator-mcp.js";
+
+// ─── Configuration ───────────────────────────────────────────────────
 
 const PLUGIN_MAP: Record<string, () => Promise<ChannelPlugin>> = {
   gitlab: async () => {
@@ -32,10 +35,10 @@ const PLUGIN_MAP: Record<string, () => Promise<ChannelPlugin>> = {
   },
 };
 
-const LOG_DIR = join(homedir(), ".cache", "channel-hub");
+const LOG_DIR = join(homedir(), ".cache", "orchestrator");
 mkdirSync(LOG_DIR, { recursive: true });
-const LOG_PATH = process.env.CHANNEL_HUB_LOG_PATH || join(LOG_DIR, "hub.log");
-const LOG_LEVEL = process.env.CHANNEL_HUB_LOG_LEVEL || "info";
+const LOG_PATH = process.env.ORCHESTRATOR_LOG_PATH || join(LOG_DIR, "orchestrator.log");
+const LOG_LEVEL = process.env.ORCHESTRATOR_LOG_LEVEL || "info";
 
 const logger = pino(
   { level: LOG_LEVEL },
@@ -47,18 +50,20 @@ const pluginNames = (process.env.CHANNEL_PLUGINS || "gitlab")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const autoStart = (process.env.CHANNEL_HUB_AUTO_START || "true") === "true";
+const autoStart = (process.env.ORCHESTRATOR_AUTO_START || "true") === "true";
+const SESSION_OWNER = process.env.ORCHESTRATOR_SESSION_OWNER || "default";
+const SESSION_ROLE = process.env.ORCHESTRATOR_SESSION_ROLE || "main";
 
-logger.info({ plugins: pluginNames, autoStart }, "channel-hub starting");
+logger.info({ plugins: pluginNames, autoStart }, "orchestrator starting");
+
+// ─── Orchestrator Core ───────────────────────────────────────────────
 
 const orchestrator = new Orchestrator({ logger });
 
-const SESSION_OWNER = process.env.CHANNEL_HUB_SESSION_OWNER || "default";
-const SESSION_ROLE = process.env.CHANNEL_HUB_SESSION_ROLE || "main";
 let activeSessionId: string | null = null;
 let activeRuntimeId: string | null = null;
 
-// ─── Plugin State ─────────────────────────────────────────────────────
+// ─── Plugin State ────────────────────────────────────────────────────
 
 interface PluginEntry {
   plugin: ChannelPlugin;
@@ -79,13 +84,13 @@ for (const name of pluginNames) {
   logger.info({ name }, "plugin loaded");
 }
 
-// ─── Hub Tools ────────────────────────────────────────────────────────
+// ─── Hub Tools (source multiplexing) ─────────────────────────────────
 
 const hubTools: ToolDef[] = [
   {
     name: "hub_subscribe",
     description:
-      "Subscribe to a channel plugin. Optionally filter to specific event types. Available plugins: " +
+      "Subscribe to a source plugin to start receiving events. Available plugins: " +
       pluginNames.join(", "),
     inputSchema: {
       type: "object",
@@ -105,7 +110,7 @@ const hubTools: ToolDef[] = [
   },
   {
     name: "hub_unsubscribe",
-    description: "Unsubscribe from a channel plugin (stop receiving events)",
+    description: "Unsubscribe from a source plugin (stop receiving events)",
     inputSchema: {
       type: "object",
       properties: {
@@ -119,7 +124,7 @@ const hubTools: ToolDef[] = [
   },
   {
     name: "hub_status",
-    description: "Show status of all channel plugins (active/inactive, tools)",
+    description: "Show status of all source plugins and orchestrator session",
     inputSchema: {
       type: "object",
       properties: {},
@@ -127,32 +132,44 @@ const hubTools: ToolDef[] = [
   },
 ];
 
-// ─── MCP Server ───────────────────────────────────────────────────────
+// ─── MCP Server ──────────────────────────────────────────────────────
 
 const pluginList = [...registry.values()].map((e) => e.plugin);
 
 const mcp = new Server(
-  { name: "channel-hub", version: "0.1.0" },
+  { name: "orchestrator", version: "0.1.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `Channel hub multiplexing: ${pluginNames.join(", ")}.
-Events arrive as <channel source="channel-hub" plugin="..." event_type="..." ...>.
+    instructions: `Session orchestrator with source multiplexing: ${pluginNames.join(", ")}.
+Events arrive as <channel source="orchestrator" plugin="..." event_type="..." ...>.
 Events are diff-based — you only receive CHANGES.
 
-Hub tools:
-- hub_subscribe: activate a plugin to start receiving events
-- hub_unsubscribe: deactivate a plugin
-- hub_status: show all plugins and their status
+Source plugin tools:
+- hub_subscribe: activate a source plugin to start receiving events
+- hub_unsubscribe: deactivate a source plugin
+- hub_status: show all plugins and orchestrator session state
+
+Orchestrator tools (session & watch management):
+- add_watch: watch an entity (pipeline, MR, thread) — matching events route to your session
+- remove_watch / list_watches: manage watches
+- list_session_feed: see attention items routed to this session
+- list_pending_deliveries / get_delivery_summary: see queued events
+- ack_attention / snooze_attention / resolve_attention: manage attention lifecycle
+- get_session_state: full session state dump
+- list_unmatched_events: events that matched no watch
+
+Session is auto-managed: created on first startup, resumed on reconnect.
+Watches survive session restarts — events queue while you're away, replay on resume.
 
 Plugin tools are available once the plugin is subscribed.
 ${pluginList.map((p) => `[${p.name}]\n  events: ${p.eventTypes.map((e) => e.name).join(", ")}\n  tools: ${p.tools.map((t) => t.name).join(", ")}`).join("\n")}`,
   },
 );
 
-// ─── Notification Forwarding ──────────────────────────────────────────
+// ─── Notification Forwarding (Orchestration Channel) ─────────────────
 
 orchestrator.setNotifyCallback(async (sessionId, content, meta) => {
   await mcp.notification({
@@ -180,7 +197,6 @@ const makeNotify =
       "event ingested",
     );
 
-    // Auto-complete watches for terminal pipeline events
     if (n.orchestration?.event_kind === "pipeline_watch_completed" && n.orchestration.entity_ref) {
       orchestrator.completeWatchesByEntity("pipeline", n.orchestration.entity_ref);
       if (n.orchestration.correlation_key) {
@@ -222,31 +238,25 @@ for (const [, entry] of registry) {
   );
 }
 
-// ─── Tool Handlers ────────────────────────────────────────────────────
+// ─── Tool Handlers ───────────────────────────────────────────────────
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => {
   const activeTools = [...registry.values()]
     .filter((e) => e.active)
     .flatMap((e) => e.plugin.tools);
-  return { tools: [...hubTools, ...activeTools] };
+  return { tools: [...hubTools, ...getOrchestratorTools(), ...activeTools] };
 });
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   logger.info({ tool: name }, "tool call");
 
+  // ── Hub tools ──
   if (name === "hub_subscribe") {
     const pluginName = (args as { plugin: string }).plugin;
     const entry = registry.get(pluginName);
     if (!entry) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Unknown plugin "${pluginName}". Available: ${pluginNames.join(", ")}`,
-          },
-        ],
-      };
+      return { content: [{ type: "text" as const, text: `Unknown plugin "${pluginName}". Available: ${pluginNames.join(", ")}` }] };
     }
     const events = (args as { events?: string[] }).events;
     const filter = events ? new Set(events) : null;
@@ -255,14 +265,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       entry.eventFilter = filter;
       logger.info({ plugin: pluginName, events: events || "all" }, "event filter updated");
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: filter
-              ? `Updated "${pluginName}" filter to: ${[...filter].join(", ")}`
-              : `Updated "${pluginName}" to receive all events`,
-          },
-        ],
+        content: [{ type: "text" as const, text: filter
+          ? `Updated "${pluginName}" filter to: ${[...filter].join(", ")}`
+          : `Updated "${pluginName}" to receive all events` }],
       };
     }
     entry.active = true;
@@ -271,72 +276,43 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     logger.info({ plugin: pluginName, events: events || "all" }, "subscribed");
     const filterInfo = filter ? ` Filtering: ${[...filter].join(", ")}` : "";
     return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Subscribed to "${pluginName}".${filterInfo} Tools: ${entry.plugin.tools.map((t) => t.name).join(", ")}`,
-        },
-      ],
+      content: [{ type: "text" as const, text: `Subscribed to "${pluginName}".${filterInfo} Tools: ${entry.plugin.tools.map((t) => t.name).join(", ")}` }],
     };
   }
 
   if (name === "hub_unsubscribe") {
     const pluginName = (args as { plugin: string }).plugin;
     const entry = registry.get(pluginName);
-    if (!entry) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Unknown plugin "${pluginName}"`,
-          },
-        ],
-      };
-    }
-    if (!entry.active) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Not subscribed to "${pluginName}"`,
-          },
-        ],
-      };
-    }
+    if (!entry) return { content: [{ type: "text" as const, text: `Unknown plugin "${pluginName}"` }] };
+    if (!entry.active) return { content: [{ type: "text" as const, text: `Not subscribed to "${pluginName}"` }] };
     entry.active = false;
     await entry.plugin.stop();
     logger.info({ plugin: pluginName }, "unsubscribed");
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Unsubscribed from "${pluginName}". Events stopped.`,
-        },
-      ],
-    };
+    return { content: [{ type: "text" as const, text: `Unsubscribed from "${pluginName}". Events stopped.` }] };
   }
 
   if (name === "hub_status") {
     const lines = [...registry.entries()].map(([n, e]) => {
-      const status = e.active ? "🟢 active" : "⚪ inactive";
+      const status = e.active ? "active" : "inactive";
       const tools = e.plugin.tools.map((t) => t.name).join(", ");
       const events = e.plugin.eventTypes.map((et) => et.name).join(", ");
-      const filterInfo = e.eventFilter
-        ? `filter: ${[...e.eventFilter].join(", ")}`
-        : "filter: all";
+      const filterInfo = e.eventFilter ? `filter: ${[...e.eventFilter].join(", ")}` : "filter: all";
       return `${n}: ${status} | ${filterInfo}\n  events: ${events}\n  tools: ${tools}`;
     });
-    return {
-      content: [{ type: "text" as const, text: lines.join("\n\n") }],
-    };
+    const sessionInfo = activeSessionId
+      ? `\nSession: ${activeSessionId}\nRuntime: ${activeRuntimeId || "none"}`
+      : "\nSession: none";
+    return { content: [{ type: "text" as const, text: lines.join("\n\n") + sessionInfo }] };
   }
 
+  // ── Orchestrator tools ──
+  const orchResult = await handleOrchestratorToolCall(orchestrator, name, (args as Record<string, unknown>) || {});
+  if (orchResult) return orchResult;
+
+  // ── Plugin tools ──
   for (const [, entry] of registry) {
     if (!entry.active) continue;
-    const result = await entry.plugin.handleToolCall(
-      name,
-      (args as Record<string, unknown>) || {},
-    );
+    const result = await entry.plugin.handleToolCall(name, (args as Record<string, unknown>) || {});
     if (result) return result;
   }
 
@@ -344,7 +320,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   throw new Error(`Unknown tool: ${name}`);
 });
 
-// ─── Start ────────────────────────────────────────────────────────────
+// ─── Start ───────────────────────────────────────────────────────────
 
 await mcp.connect(new StdioServerTransport());
 logger.info("MCP connected via stdio");
@@ -352,12 +328,12 @@ logger.info("MCP connected via stdio");
 // ─── Session Auto-Management ─────────────────────────────────────────
 
 const { session, resumed } = orchestrator.findOrCreateSession(SESSION_OWNER, {
-  session_name: `hub-${SESSION_ROLE}`,
+  session_name: `orchestrator-${SESSION_ROLE}`,
   role: SESSION_ROLE,
 });
 activeSessionId = session.session_id;
 orchestrator.setFallbackSession(activeSessionId);
-logger.info({ sessionId: activeSessionId, resumed }, "orchestrator session ready");
+logger.info({ sessionId: activeSessionId, resumed }, "session ready");
 
 const runtime = orchestrator.attachRuntime(activeSessionId, undefined, "stdio");
 activeRuntimeId = runtime.runtime_id;
@@ -403,7 +379,7 @@ const shutdown = async () => {
   clearInterval(maintenanceTimer);
   if (activeSessionId) {
     orchestrator.markSessionResumable(activeSessionId);
-    logger.info({ sessionId: activeSessionId }, "session marked resumable for next startup");
+    logger.info({ sessionId: activeSessionId }, "session marked resumable");
   }
   for (const [, entry] of registry) {
     if (!entry.active) continue;
