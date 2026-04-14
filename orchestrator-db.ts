@@ -232,6 +232,7 @@ export interface OrchestratorStmts {
   getActiveWatchesByEntity: Database.Statement;
   getActiveWatchesByCorrelation: Database.Statement;
   expireStaleWatches: Database.Statement;
+  findFallbackSession: Database.Statement;
 
   insertEvent: Database.Statement;
   getEventByDedup: Database.Statement;
@@ -251,6 +252,8 @@ export interface OrchestratorStmts {
   markDeliveryReplayed: Database.Statement;
   listPendingBySession: Database.Statement;
   expireStaleDeliveries: Database.Statement;
+  purgeOldEvents: Database.Statement;
+  completeWatchesByEntity: Database.Statement;
 
   upsertCheckpoint: Database.Statement;
   getCheckpoint: Database.Statement;
@@ -302,6 +305,7 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
     getActiveWatchesByEntity: db.prepare("SELECT * FROM watches WHERE entity_type = ? AND entity_ref = ? AND status = 'active'"),
     getActiveWatchesByCorrelation: db.prepare("SELECT * FROM watches WHERE correlation_key = ? AND status = 'active'"),
     expireStaleWatches: db.prepare("UPDATE watches SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at < ?"),
+    findFallbackSession: db.prepare("SELECT * FROM sessions WHERE status = 'active' AND role IN ('main', 'ops') ORDER BY role ASC, last_seen_at DESC LIMIT 1"),
 
     insertEvent: db.prepare(`
       INSERT INTO events (event_id, source, event_kind, source_ref, thread_ref, actor_ref, title_hint, importance_hint, dedup_key, correlation_key, raw_payload_ref, normalized_json, created_at)
@@ -335,6 +339,8 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
     markDeliveryReplayed: db.prepare("UPDATE pending_deliveries SET delivery_state = 'replayed-on-resume', replayed_at = ? WHERE delivery_id = ?"),
     listPendingBySession: db.prepare("SELECT * FROM pending_deliveries WHERE session_id = ? AND delivery_state = 'queued' ORDER BY queued_at ASC"),
     expireStaleDeliveries: db.prepare("UPDATE pending_deliveries SET delivery_state = 'expired', expired_at = ? WHERE delivery_state = 'queued' AND queued_at < ?"),
+    purgeOldEvents: db.prepare("DELETE FROM events WHERE created_at < ? AND event_id NOT IN (SELECT event_id FROM attention_items) AND event_id NOT IN (SELECT event_id FROM pending_deliveries WHERE delivery_state = 'queued')"),
+    completeWatchesByEntity: db.prepare("UPDATE watches SET status = 'completed', updated_at = ? WHERE entity_type = ? AND entity_ref = ? AND status = 'active'"),
 
     upsertCheckpoint: db.prepare(`
       INSERT INTO source_checkpoints (source, scope_key, last_cursor, last_seen_timestamp, updated_at)

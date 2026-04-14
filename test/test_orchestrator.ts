@@ -322,6 +322,127 @@ async function run() {
 
   orch2.close();
 
+  // ─── Phase 3+4 Tests ───────────────────────────────────────────────
+
+  const orch3 = new Orchestrator({ dbPath });
+  const delivered3: Array<{ sessionId: string; content: string; meta: Record<string, string> }> = [];
+  orch3.setNotifyCallback(async (sessionId, content, meta) => {
+    delivered3.push({ sessionId, content, meta });
+  });
+
+  console.log("\n--- Phase 3: Fallback routing (critical unmatched) ---");
+  const mainSession = orch3.registerSession({ session_name: "main", role: "main", owner: "test" });
+  const mainRt = orch3.attachRuntime(mainSession.session_id);
+  orch3.setFallbackSession(mainSession.session_id);
+
+  const criticalNotification = {
+    content: "Pipeline #999 FAILED on production",
+    meta: { event_type: "pipeline_status_changed", plugin: "gitlab" },
+    orchestration: {
+      source: "gitlab",
+      event_kind: "pipeline_status_changed",
+      entity_type: "pipeline",
+      entity_ref: "gitlab:critical:pipeline:999",
+      importance_hint: "critical" as const,
+      title_hint: "Pipeline #999 FAILED on production",
+      dedup_key: "fallback-critical-event",
+    },
+  };
+  const criticalIngest = orch3.ingestEvent(criticalNotification);
+  const fallbackResult = orch3.routeToFallback(criticalNotification, criticalIngest.eventId);
+  assert(fallbackResult !== null, "fallback routing returned decision");
+  assert(fallbackResult!.mode === "live", "fallback delivered live (runtime attached)");
+  assert(fallbackResult!.sessionId === mainSession.session_id, "fallback routed to main session");
+  assert(delivered3.length === 1, "fallback notification sent");
+  assert(delivered3[0].meta.fallback === "true", "fallback flag in meta");
+
+  console.log("\n--- Phase 3: Fallback routing (detached) ---");
+  orch3.detachRuntime(mainRt.runtime_id);
+  const eventId2 = orch3.ingestEvent({
+    content: "dummy event for fallback test",
+    meta: { event_type: "test", plugin: "test" },
+    orchestration: { source: "test", event_kind: "test", dedup_key: "fallback-test-event" },
+  }).eventId;
+
+  const fallbackQueued = orch3.routeToFallback(
+    {
+      content: "Build FAILURE on production",
+      meta: { event_type: "build_completed", plugin: "jenkins" },
+      orchestration: { source: "jenkins", event_kind: "build_completed", importance_hint: "high" },
+    },
+    eventId2,
+  );
+  assert(fallbackQueued !== null, "fallback queued when detached");
+  assert(fallbackQueued!.mode === "queued", "fallback mode is queued");
+  assert(delivered3.length === 1, "no live notification when detached");
+
+  console.log("\n--- Phase 3: Watch auto-complete ---");
+  orch3.attachRuntime(mainSession.session_id);
+  const pipelineWatch = orch3.addWatch({
+    session_id: mainSession.session_id,
+    watch_type: "pipeline-chain",
+    entity_type: "pipeline",
+    entity_ref: "gitlab:100:ref:main",
+    correlation_key: "gitlab:100:ref:main",
+  });
+  assert(pipelineWatch.status === "active", "pipeline watch active");
+
+  const completed = orch3.completeWatchesByEntity("pipeline", "gitlab:100:ref:main");
+  assert(completed === 1, "1 watch auto-completed");
+  const watchesAfterComplete = orch3.listWatches(mainSession.session_id);
+  assert(watchesAfterComplete.length === 0, "no active watches after completion");
+
+  console.log("\n--- Phase 4: Event retention cleanup ---");
+  // Insert an old event that's not referenced by attention/delivery
+  const oldEventResult = orch3.ingestEvent({
+    content: "ancient event",
+    meta: { event_type: "test", plugin: "test" },
+    orchestration: { source: "test", event_kind: "old_event", dedup_key: `old-event-${Date.now()}` },
+  });
+  // Purge with 0 retention — everything not referenced gets purged
+  const purged = orch3.purgeOldEvents(0);
+  assert(purged >= 1, "old events purged");
+
+  console.log("\n--- Phase 4: Richer replay digest ---");
+  // Use a fresh session for clean digest test
+  const digestSession = orch3.registerSession({ session_name: "digest-test", role: "bugfix", owner: "digest-user" });
+  const digestWatch = orch3.addWatch({
+    session_id: digestSession.session_id,
+    watch_type: "merge-request",
+    entity_type: "merge_request",
+    entity_ref: "gitlab:proj:mr:55",
+  });
+
+  for (let i = 0; i < 3; i++) {
+    orch3.ingestEvent({
+      content: `Comment ${i} on MR !55`,
+      meta: { event_type: "mr_comment", plugin: "gitlab" },
+      orchestration: {
+        source: "gitlab",
+        event_kind: "mr_comment",
+        entity_type: "merge_request",
+        entity_ref: "gitlab:proj:mr:55",
+        dedup_key: `mr55-comment-${i}`,
+        importance_hint: "normal",
+        title_hint: `Comment ${i} on MR !55`,
+      },
+    });
+  }
+
+  const digestPending = orch3.listPendingDeliveries(digestSession.session_id);
+  assert(digestPending.length === 3, `3 items pending for digest (got ${digestPending.length})`);
+
+  const digestNotifications: string[] = [];
+  await orch3.replayOnResume(digestSession.session_id, async (content) => {
+    digestNotifications.push(content);
+  });
+  assert(digestNotifications.length >= 1, "digest replay produced notifications");
+  const digestText = digestNotifications.join("\n");
+  assert(digestText.includes("gitlab"), "digest mentions source");
+  assert(digestText.includes("[replay"), "digest has replay marker");
+
+  orch3.close();
+
   try { unlinkSync(dbPath); } catch {}
 
   console.log(`\n=======================`);

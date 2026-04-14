@@ -192,19 +192,42 @@ const makeNotify =
       "event ingested",
     );
 
+    // Auto-complete watches for terminal pipeline events
+    if (n.orchestration?.event_kind === "pipeline_watch_completed" && n.orchestration.entity_ref) {
+      orchestrator.completeWatchesByEntity("pipeline", n.orchestration.entity_ref);
+      if (n.orchestration.correlation_key) {
+        orchestrator.completeWatchesByEntity("pipeline", n.orchestration.correlation_key);
+      }
+    }
+
     if (result.matchedWatches === 0) {
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: n.content,
-          meta: { plugin: entry.plugin.name, ...n.meta },
-        },
-      });
+      const importance = n.orchestration?.importance_hint || "normal";
+      if ((importance === "high" || importance === "critical") && !result.deduplicated) {
+        orchestrator.routeToFallback(n, result.eventId);
+      } else {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: n.content,
+            meta: { plugin: entry.plugin.name, ...n.meta },
+          },
+        });
+      }
     }
   };
 
 for (const [, entry] of registry) {
   await entry.plugin.init(makeNotify(entry));
+  if (entry.plugin.setOnWatchRegistered) {
+    entry.plugin.setOnWatchRegistered((watch) => {
+      if (!activeSessionId) return;
+      orchestrator.addWatch({
+        session_id: activeSessionId,
+        ...watch,
+      });
+      logger.info({ plugin: entry.plugin.name, entityRef: watch.entity_ref }, "orchestrator watch created from plugin");
+    });
+  }
   logger.info(
     { name: entry.plugin.name, tools: entry.plugin.tools.length },
     "plugin initialized",
@@ -348,6 +371,7 @@ const { session, resumed } = orchestrator.findOrCreateSession(SESSION_OWNER, {
   role: SESSION_ROLE,
 });
 activeSessionId = session.session_id;
+orchestrator.setFallbackSession(activeSessionId);
 logger.info({ sessionId: activeSessionId, resumed }, "orchestrator session ready");
 
 const runtime = orchestrator.attachRuntime(activeSessionId, undefined, "stdio");
@@ -367,12 +391,17 @@ if (resumed) {
   }
 }
 
+let maintenanceCycle = 0;
 const maintenanceTimer = setInterval(() => {
   orchestrator.expireStaleWatches();
   orchestrator.expireStaleDeliveries();
   orchestrator.detachStaleRuntimes();
   if (activeRuntimeId) {
     orchestrator.heartbeat(activeRuntimeId);
+  }
+  maintenanceCycle++;
+  if (maintenanceCycle % 60 === 0) {
+    orchestrator.purgeOldEvents();
   }
 }, 60_000);
 

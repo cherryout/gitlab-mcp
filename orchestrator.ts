@@ -437,4 +437,85 @@ export class Orchestrator {
     }
     return result.changes;
   }
+
+  purgeOldEvents(retentionMs: number = 7 * 24 * 60 * 60 * 1000): number {
+    const cutoff = Date.now() - retentionMs;
+    const result = this.stmts.purgeOldEvents.run(cutoff);
+    if (result.changes > 0) {
+      this.logger.info({ purged: result.changes }, "old events purged");
+    }
+    return result.changes;
+  }
+
+  completeWatchesByEntity(entityType: string, entityRef: string): number {
+    const now = Date.now();
+    const result = this.stmts.completeWatchesByEntity.run(now, entityType, entityRef);
+    if (result.changes > 0) {
+      this.logger.info({ entityType, entityRef, completed: result.changes }, "watches auto-completed");
+    }
+    return result.changes;
+  }
+
+  // ─── Fallback Routing ───────────────────────────────────────────────
+
+  private fallbackSessionId: string | null = null;
+
+  setFallbackSession(sessionId: string): void {
+    this.fallbackSessionId = sessionId;
+  }
+
+  routeToFallback(notification: ChannelNotification, eventId: string): DeliveryDecision | null {
+    const targetSessionId = this.fallbackSessionId ||
+      (this.stmts.findFallbackSession.get() as SessionRow | undefined)?.session_id;
+
+    if (!targetSessionId) return null;
+
+    const session = this.stmts.getSession.get(targetSessionId) as SessionRow | undefined;
+    if (!session || session.status === "archived") return null;
+
+    const runtime = (this.stmts.getActiveRuntime.get(targetSessionId) as RuntimeRow | undefined) || null;
+    const orch = notification.orchestration;
+    const importanceHint = orch?.importance_hint || "normal";
+    const titleHint = orch?.title_hint || notification.content.slice(0, 120);
+
+    const now = Date.now();
+    const attentionId = randomUUID();
+    this.stmts.insertAttention.run(
+      attentionId,
+      targetSessionId,
+      eventId,
+      "fallback",
+      importanceHint,
+      0,
+      "new",
+      null,
+      titleHint,
+      null,
+      now,
+      now,
+    );
+
+    const deliveryId = randomUUID();
+    const isAttached = runtime !== null && runtime.attached === 1;
+
+    if (isAttached) {
+      this.stmts.insertDelivery.run(deliveryId, targetSessionId, eventId, attentionId, "delivered-live", now, now, null, null, null);
+      this.stmts.updateAttentionState.run("delivered", now, attentionId);
+      this.deliverLive(targetSessionId, notification.content, {
+        orchestrated: "true",
+        fallback: "true",
+        session_id: targetSessionId,
+        event_id: eventId,
+        attention_id: attentionId,
+        source: orch?.source || notification.meta.plugin || "unknown",
+        event_kind: orch?.event_kind || notification.meta.event_type || "unknown",
+        importance: importanceHint,
+      });
+      return { mode: "live", sessionId: targetSessionId, attentionId, eventId };
+    }
+
+    this.stmts.insertDelivery.run(deliveryId, targetSessionId, eventId, attentionId, "queued", now, null, null, null, null);
+    this.stmts.updateAttentionState.run("queued", now, attentionId);
+    return { mode: "queued", sessionId: targetSessionId, attentionId, eventId };
+  }
 }

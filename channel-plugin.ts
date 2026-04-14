@@ -40,6 +40,16 @@ export interface EventTypeDef {
   description: string;
 }
 
+export interface WatchRegistration {
+  watch_type: string;
+  entity_type: string;
+  entity_ref: string;
+  correlation_key?: string;
+  expires_at?: number;
+}
+
+export type OnWatchRegisteredFn = (watch: WatchRegistration) => void;
+
 export interface ChannelPlugin {
   readonly name: string;
   readonly tools: ToolDef[];
@@ -51,4 +61,5 @@ export interface ChannelPlugin {
     name: string,
     args: Record<string, unknown>,
   ): Promise<ToolCallResult | null>;
+  setOnWatchRegistered?(fn: OnWatchRegisteredFn): void;
 }

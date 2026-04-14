@@ -127,11 +127,23 @@ export async function replayPendingDeliveries(
   }
 
   if (rest.length > 0) {
-    const lines = Object.entries(summary.bySource)
-      .map(([source, count]) => `${count} from ${source}`)
-      .join(", ");
+    const bySourceKind: Record<string, string[]> = {};
+    for (const item of rest) {
+      const event = events.find((e) => e.event_id === item.eventId);
+      const key = event?.source || "unknown";
+      if (!bySourceKind[key]) bySourceKind[key] = [];
+      if (item.summaryHint) bySourceKind[key].push(item.summaryHint);
+    }
+
+    const sections = Object.entries(bySourceKind).map(([source, hints]) => {
+      const unique = [...new Set(hints)].slice(0, 3);
+      const detail = unique.length > 0 ? `: ${unique.join("; ")}` : "";
+      const more = hints.length > 3 ? ` (+${hints.length - 3} more)` : "";
+      return `  ${source}: ${hints.length} items${detail}${more}`;
+    });
+
     await notifyFn(
-      `[replay digest] ${rest.length} queued items: ${lines}`,
+      `[replay digest] ${rest.length} queued items:\n${sections.join("\n")}`,
       {
         orchestrated: "true",
         replay: "true",

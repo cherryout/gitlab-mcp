@@ -2,6 +2,7 @@ import type {
   ChannelPlugin,
   EventTypeDef,
   NotifyFn,
+  OnWatchRegisteredFn,
   ToolDef,
   ToolCallResult,
 } from "../channel-plugin.js";
@@ -111,6 +112,7 @@ export class GitLabChannelPlugin implements ChannelPlugin {
   ];
 
   private notify!: NotifyFn;
+  private onWatchRegistered?: OnWatchRegisteredFn;
   private db!: Database.Database;
   private stmts!: Stmts;
   private logger!: pino.Logger;
@@ -201,6 +203,10 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     this.logger.info({ api: this.apiUrl, pollInterval: this.pollIntervalMs, namespace: this.namespaceFilter || "(all)", dbPath, logPath }, "gitlab plugin initialized");
   }
 
+  setOnWatchRegistered(fn: OnWatchRegisteredFn): void {
+    this.onWatchRegistered = fn;
+  }
+
   async start() {
     this.logger.info("starting poll loops");
     this.schedulePoll();
@@ -256,6 +262,15 @@ export class GitLabChannelPlugin implements ChannelPlugin {
       }
       this.stmts.insertWatch.run(project_id, ref, null, Date.now());
       this.logger.info({ project_id, ref }, "watch started");
+      if (this.onWatchRegistered) {
+        this.onWatchRegistered({
+          watch_type: "pipeline-chain",
+          entity_type: "pipeline",
+          entity_ref: `gitlab:${project_id}:ref:${ref}`,
+          correlation_key: `gitlab:${project_id}:ref:${ref}`,
+          expires_at: Date.now() + this.watchTimeoutMs,
+        });
+      }
       return { content: [{ type: "text", text: `Watching pipeline on branch "${ref}" for project ${project_id}. Will notify when it finishes.` }] };
     }
 
