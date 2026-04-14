@@ -15,6 +15,8 @@ import type {
   ChannelNotification,
   ToolDef,
 } from "./channel-plugin.js";
+import { Orchestrator } from "./orchestrator.js";
+import { getOrchestratorTools, handleOrchestratorToolCall } from "./orchestrator-mcp.js";
 
 const PLUGIN_MAP: Record<string, () => Promise<ChannelPlugin>> = {
   gitlab: async () => {
@@ -49,6 +51,8 @@ const pluginNames = (process.env.CHANNEL_PLUGINS || "gitlab")
 const autoStart = (process.env.CHANNEL_HUB_AUTO_START || "true") === "true";
 
 logger.info({ plugins: pluginNames, autoStart }, "channel-hub starting");
+
+const orchestrator = new Orchestrator({ logger });
 
 // ─── Plugin State ─────────────────────────────────────────────────────
 
@@ -146,6 +150,16 @@ ${pluginList.map((p) => `[${p.name}]\n  events: ${p.eventTypes.map((e) => e.name
 
 // ─── Notification Forwarding ──────────────────────────────────────────
 
+orchestrator.setNotifyCallback(async (sessionId, content, meta) => {
+  await mcp.notification({
+    method: "notifications/claude/channel",
+    params: {
+      content,
+      meta: { ...meta, orchestrated: "true", session_id: sessionId },
+    },
+  });
+});
+
 const makeNotify =
   (entry: PluginEntry) =>
   async (n: ChannelNotification): Promise<void> => {
@@ -155,17 +169,22 @@ const makeNotify =
       logger.debug({ plugin: entry.plugin.name, eventType, filtered: true }, "event filtered out");
       return;
     }
+
+    const result = orchestrator.ingestEvent(n);
     logger.debug(
-      { plugin: entry.plugin.name, eventType },
-      "forwarding notification",
+      { plugin: entry.plugin.name, eventType, eventId: result.eventId, deduplicated: result.deduplicated, matchedWatches: result.matchedWatches },
+      "event ingested",
     );
-    await mcp.notification({
-      method: "notifications/claude/channel",
-      params: {
-        content: n.content,
-        meta: { plugin: entry.plugin.name, ...n.meta },
-      },
-    });
+
+    if (result.matchedWatches === 0) {
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: n.content,
+          meta: { plugin: entry.plugin.name, ...n.meta },
+        },
+      });
+    }
   };
 
 for (const [, entry] of registry) {
@@ -182,7 +201,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
   const activeTools = [...registry.values()]
     .filter((e) => e.active)
     .flatMap((e) => e.plugin.tools);
-  return { tools: [...hubTools, ...activeTools] };
+  return { tools: [...hubTools, ...getOrchestratorTools(), ...activeTools] };
 });
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -285,6 +304,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 
+  const orchResult = await handleOrchestratorToolCall(orchestrator, name, (args as Record<string, unknown>) || {});
+  if (orchResult) return orchResult;
+
   for (const [, entry] of registry) {
     if (!entry.active) continue;
     const result = await entry.plugin.handleToolCall(
@@ -303,6 +325,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 await mcp.connect(new StdioServerTransport());
 logger.info("MCP connected via stdio");
 
+const maintenanceTimer = setInterval(() => {
+  orchestrator.expireStaleWatches();
+  orchestrator.expireStaleDeliveries();
+}, 60_000);
+
 if (autoStart) {
   for (const [name, entry] of registry) {
     entry.active = true;
@@ -313,6 +340,7 @@ if (autoStart) {
 
 const shutdown = async () => {
   logger.info("shutting down");
+  clearInterval(maintenanceTimer);
   for (const [, entry] of registry) {
     if (!entry.active) continue;
     try {
@@ -321,6 +349,7 @@ const shutdown = async () => {
       logger.error({ err, name: entry.plugin.name }, "plugin stop error");
     }
   }
+  orchestrator.close();
   process.exit(0);
 };
 

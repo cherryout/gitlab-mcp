@@ -385,6 +385,23 @@ export class SlackChannelPlugin implements ChannelPlugin {
           ts: msg.ts,
           ...(msg.threadTs ? { thread_ts: msg.threadTs } : {}),
         },
+        orchestration: {
+          source: "slack",
+          event_kind: eventType,
+          entity_type: msg.threadTs ? "slack_thread" : "slack_channel",
+          entity_ref: msg.threadTs
+            ? `slack:${channel.id}:thread:${msg.threadTs}`
+            : `slack:${channel.id}`,
+          correlation_key: msg.threadTs
+            ? `slack:${channel.id}:thread:${msg.threadTs}`
+            : `slack:${channel.id}`,
+          dedup_key: `slack:${msg.id}`,
+          importance_hint: eventType === "mention" ? "high" : "normal",
+          actor_ref: `slack:${msg.user}`,
+          title_hint: `${msg.user} in #${channel.name}: ${msg.text.slice(0, 80)}`,
+          source_ref: msg.id,
+          thread_ref: msg.threadTs ? `slack:${channel.id}:thread:${msg.threadTs}` : undefined,
+        },
       });
     }
   }

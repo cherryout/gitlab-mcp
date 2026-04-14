@@ -1,6 +1,21 @@
+export interface OrchestrationMeta {
+  correlation_key?: string;
+  dedup_key?: string;
+  entity_type?: string;
+  entity_ref?: string;
+  importance_hint?: string;
+  source?: string;
+  event_kind?: string;
+  actor_ref?: string;
+  title_hint?: string;
+  source_ref?: string;
+  thread_ref?: string;
+}
+
 export interface ChannelNotification {
   content: string;
   meta: Record<string, string>;
+  orchestration?: OrchestrationMeta;
 }
 
 export type NotifyFn = (notification: ChannelNotification) => Promise<void>;

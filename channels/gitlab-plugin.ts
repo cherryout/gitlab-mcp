@@ -313,6 +313,19 @@ export class GitLabChannelPlugin implements ChannelPlugin {
                 project: todo.project.path_with_namespace, project_id: String(todo.project.id),
                 author: todo.author.username, target_url: todo.target_url,
               },
+              orchestration: {
+                source: "gitlab",
+                event_kind: "todo_created",
+                entity_type: "todo",
+                entity_ref: `gitlab:${todo.project.path_with_namespace}:todo:${todo.id}`,
+                correlation_key: `gitlab:${todo.project.path_with_namespace}:${todo.target_type.toLowerCase()}:${todo.target.iid}`,
+                dedup_key: `gitlab:todo:${todo.id}:created`,
+                importance_hint: "normal",
+                actor_ref: `gitlab:${todo.author.username}`,
+                title_hint: `${todo.action_name}: ${todo.target.title}`,
+                source_ref: todo.target_url,
+                thread_ref: `gitlab:${todo.project.path_with_namespace}:${todo.target_type.toLowerCase()}:${todo.target.iid}`,
+              },
             });
           }
         }
@@ -328,6 +341,14 @@ export class GitLabChannelPlugin implements ChannelPlugin {
             await this.notify({
               content: `Todo #${row.id} resolved`,
               meta: { event_type: "todo_resolved", todo_id: String(row.id), project: todo?.project_path || "" },
+              orchestration: {
+                source: "gitlab",
+                event_kind: "todo_resolved",
+                entity_type: "todo",
+                entity_ref: `gitlab:todo:${row.id}`,
+                dedup_key: `gitlab:todo:${row.id}:resolved`,
+                importance_hint: "low",
+              },
             });
           }
         }
@@ -397,6 +418,19 @@ export class GitLabChannelPlugin implements ChannelPlugin {
                 old_status: oldStatus, new_status: pipeline.status, ref: pipeline.ref,
                 project: String(project.id), web_url: pipeline.web_url,
               },
+              orchestration: {
+                source: "gitlab",
+                event_kind: "pipeline_status_changed",
+                entity_type: "pipeline",
+                entity_ref: `gitlab:${project.id}:pipeline:${pipeline.id}`,
+                correlation_key: `gitlab:${project.id}:ref:${pipeline.ref}`,
+                dedup_key: `gitlab:pipeline:${pipeline.id}:${pipeline.status}`,
+                importance_hint: TERMINAL_STATUSES.has(pipeline.status)
+                  ? (pipeline.status === "failed" ? "high" : "normal")
+                  : "low",
+                source_ref: pipeline.web_url,
+                title_hint: `Pipeline #${pipeline.id} ${oldStatus} -> ${pipeline.status}`,
+              },
             });
           }
         }
@@ -421,6 +455,15 @@ export class GitLabChannelPlugin implements ChannelPlugin {
         await this.notify({
           content: `Pipeline watch expired for branch "${watch.ref}" on project ${watch.project_id} (30 min timeout)`,
           meta: { event_type: "pipeline_watch_expired", project: watch.project_id, ref: watch.ref },
+          orchestration: {
+            source: "gitlab",
+            event_kind: "pipeline_watch_expired",
+            entity_type: "pipeline",
+            entity_ref: `gitlab:${watch.project_id}:ref:${watch.ref}`,
+            correlation_key: `gitlab:${watch.project_id}:ref:${watch.ref}`,
+            dedup_key: `gitlab:watch_expired:${watch.project_id}:${watch.ref}:${Date.now()}`,
+            importance_hint: "normal",
+          },
         });
         continue;
       }
@@ -449,6 +492,17 @@ export class GitLabChannelPlugin implements ChannelPlugin {
             meta: {
               event_type: "pipeline_watch_completed", pipeline_id: String(latest.id),
               status: latest.status, ref: watch.ref, project: watch.project_id, web_url: latest.web_url,
+            },
+            orchestration: {
+              source: "gitlab",
+              event_kind: "pipeline_watch_completed",
+              entity_type: "pipeline",
+              entity_ref: `gitlab:${watch.project_id}:pipeline:${latest.id}`,
+              correlation_key: `gitlab:${watch.project_id}:ref:${watch.ref}`,
+              dedup_key: `gitlab:pipeline_watch:${latest.id}:${latest.status}`,
+              importance_hint: latest.status === "failed" ? "high" : "normal",
+              source_ref: latest.web_url,
+              title_hint: `Pipeline #${latest.id} on "${watch.ref}": ${latest.status}`,
             },
           });
         }

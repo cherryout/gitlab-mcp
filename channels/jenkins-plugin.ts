@@ -227,6 +227,17 @@ export class JenkinsChannelPlugin implements ChannelPlugin {
             build_number: String(build.number),
             url: build.url,
           },
+          orchestration: {
+            source: "jenkins",
+            event_kind: "build_started",
+            entity_type: "build",
+            entity_ref: `jenkins:${jobPath}:build:${build.number}`,
+            correlation_key: `jenkins:${jobPath}`,
+            dedup_key: `jenkins:${jobPath}:${build.number}:started`,
+            importance_hint: "low",
+            source_ref: build.url,
+            title_hint: `Build #${build.number} started on "${jobPath}"`,
+          },
         });
       }
 
@@ -250,6 +261,17 @@ export class JenkinsChannelPlugin implements ChannelPlugin {
             result: build.result,
             duration: String(build.duration),
             url: build.url,
+          },
+          orchestration: {
+            source: "jenkins",
+            event_kind: "build_completed",
+            entity_type: "build",
+            entity_ref: `jenkins:${jobPath}:build:${build.number}`,
+            correlation_key: `jenkins:${jobPath}`,
+            dedup_key: `jenkins:${jobPath}:${build.number}:${build.result}`,
+            importance_hint: build.result === "FAILURE" ? "high" : "normal",
+            source_ref: build.url,
+            title_hint: `Build #${build.number} on "${jobPath}": ${build.result}`,
           },
         });
       }
