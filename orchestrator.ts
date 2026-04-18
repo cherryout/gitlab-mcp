@@ -103,10 +103,21 @@ export class Orchestrator {
     const existing = this.stmts.findResumableSession.get(owner) as SessionRow | undefined;
     if (existing) {
       const now = Date.now();
+      const liveRuntime = this.stmts.getActiveRuntime.get(existing.session_id) as RuntimeRow | undefined;
+      if (liveRuntime && now - liveRuntime.last_heartbeat_at < 120_000) {
+        this.logger.warn(
+          { sessionId: existing.session_id, owner, stolenFromRuntime: liveRuntime.runtime_id, heartbeatAge: now - liveRuntime.last_heartbeat_at },
+          "another runtime appears live; stealing attachment (multi-terminal not supported, use ORCHESTRATOR_SESSION_OWNER for parallel sessions)",
+        );
+      }
       this.stmts.detachAllRuntimes.run(existing.session_id);
       this.stmts.updateSessionStatus.run("active", now, existing.session_id);
       this.stmts.updateSessionLastSeen.run(now, existing.session_id);
-      this.logger.info({ sessionId: existing.session_id, owner }, "session resumed");
+      const wasActive = existing.status === "active";
+      this.logger.info(
+        { sessionId: existing.session_id, owner, previousStatus: existing.status, crashRecovery: wasActive && !liveRuntime },
+        wasActive && !liveRuntime ? "session recovered after crash" : "session resumed",
+      );
       return { session: this.stmts.getSession.get(existing.session_id) as SessionRow, resumed: true };
     }
     const session = this.registerSession({ ...opts, owner });
@@ -190,6 +201,16 @@ export class Orchestrator {
   addWatch(params: AddWatchParams): WatchRow {
     const session = this.stmts.getSession.get(params.session_id) as SessionRow | undefined;
     if (!session) throw new Error(`Session not found: ${params.session_id}`);
+
+    const existing = this.stmts.getActiveWatchInSession.get(
+      params.session_id,
+      params.entity_type,
+      params.entity_ref,
+    ) as WatchRow | undefined;
+    if (existing) {
+      this.logger.info({ watchId: existing.watch_id, entityRef: params.entity_ref }, "watch already exists, returning existing");
+      return existing;
+    }
 
     const watchId = randomUUID();
     const now = Date.now();
@@ -456,66 +477,4 @@ export class Orchestrator {
     return result.changes;
   }
 
-  // ─── Fallback Routing ───────────────────────────────────────────────
-
-  private fallbackSessionId: string | null = null;
-
-  setFallbackSession(sessionId: string): void {
-    this.fallbackSessionId = sessionId;
-  }
-
-  routeToFallback(notification: ChannelNotification, eventId: string): DeliveryDecision | null {
-    const targetSessionId = this.fallbackSessionId ||
-      (this.stmts.findFallbackSession.get() as SessionRow | undefined)?.session_id;
-
-    if (!targetSessionId) return null;
-
-    const session = this.stmts.getSession.get(targetSessionId) as SessionRow | undefined;
-    if (!session || session.status === "archived") return null;
-
-    const runtime = (this.stmts.getActiveRuntime.get(targetSessionId) as RuntimeRow | undefined) || null;
-    const orch = notification.orchestration;
-    const importanceHint = orch?.importance_hint || "normal";
-    const titleHint = orch?.title_hint || notification.content.slice(0, 120);
-
-    const now = Date.now();
-    const attentionId = randomUUID();
-    this.stmts.insertAttention.run(
-      attentionId,
-      targetSessionId,
-      eventId,
-      "fallback",
-      importanceHint,
-      0,
-      "new",
-      null,
-      titleHint,
-      null,
-      now,
-      now,
-    );
-
-    const deliveryId = randomUUID();
-    const isAttached = runtime !== null && runtime.attached === 1;
-
-    if (isAttached) {
-      this.stmts.insertDelivery.run(deliveryId, targetSessionId, eventId, attentionId, "delivered-live", now, now, null, null, null);
-      this.stmts.updateAttentionState.run("delivered", now, attentionId);
-      this.deliverLive(targetSessionId, notification.content, {
-        orchestrated: "true",
-        fallback: "true",
-        session_id: targetSessionId,
-        event_id: eventId,
-        attention_id: attentionId,
-        source: orch?.source || notification.meta.plugin || "unknown",
-        event_kind: orch?.event_kind || notification.meta.event_type || "unknown",
-        importance: importanceHint,
-      });
-      return { mode: "live", sessionId: targetSessionId, attentionId, eventId };
-    }
-
-    this.stmts.insertDelivery.run(deliveryId, targetSessionId, eventId, attentionId, "queued", now, null, null, null, null);
-    this.stmts.updateAttentionState.run("queued", now, attentionId);
-    return { mode: "queued", sessionId: targetSessionId, attentionId, eventId };
-  }
 }

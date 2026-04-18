@@ -2,7 +2,6 @@ import type {
   ChannelPlugin,
   EventTypeDef,
   NotifyFn,
-  OnWatchRegisteredFn,
   ToolDef,
   ToolCallResult,
 } from "../channel-plugin.js";
@@ -71,48 +70,9 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     { name: "pipeline_watch_expired", description: "Pipeline watch timed out (30 min)" },
   ];
 
-  readonly tools: ToolDef[] = [
-    {
-      name: "gitlab_reply",
-      description: "Post a comment on a GitLab merge request or issue",
-      inputSchema: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: "Project ID or URL-encoded path" },
-          mr_iid: { type: "string", description: "Merge request IID (omit for issues)" },
-          issue_iid: { type: "string", description: "Issue IID (omit for MRs)" },
-          text: { type: "string", description: "Comment body (markdown)" },
-        },
-        required: ["project_id", "text"],
-      },
-    },
-    {
-      name: "gitlab_mark_todo_done",
-      description: "Mark a GitLab todo as done",
-      inputSchema: {
-        type: "object",
-        properties: {
-          todo_id: { type: "string", description: "The todo ID to mark as done" },
-        },
-        required: ["todo_id"],
-      },
-    },
-    {
-      name: "gitlab_watch_pipeline",
-      description: "Watch a pipeline on a specific branch. Notifies when it finishes (success/failed/canceled). Auto-expires after 30 minutes.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          project_id: { type: "string", description: "Project ID or URL-encoded path" },
-          ref: { type: "string", description: "Branch name to watch (e.g. 'int', 'main')" },
-        },
-        required: ["project_id", "ref"],
-      },
-    },
-  ];
+  readonly tools: ToolDef[] = [];
 
   private notify!: NotifyFn;
-  private onWatchRegistered?: OnWatchRegisteredFn;
   private db!: Database.Database;
   private stmts!: Stmts;
   private logger!: pino.Logger;
@@ -203,8 +163,12 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     this.logger.info({ api: this.apiUrl, pollInterval: this.pollIntervalMs, namespace: this.namespaceFilter || "(all)", dbPath, logPath }, "gitlab plugin initialized");
   }
 
-  setOnWatchRegistered(fn: OnWatchRegisteredFn): void {
-    this.onWatchRegistered = fn;
+  startPipelineWatch(projectId: string, ref: string): boolean {
+    const existing = this.stmts.getWatch.get(projectId, ref) as { project_id: string } | undefined;
+    if (existing) return false;
+    this.stmts.insertWatch.run(projectId, ref, null, Date.now());
+    this.logger.info({ projectId, ref }, "pipeline watch started");
+    return true;
   }
 
   async start() {
@@ -220,60 +184,7 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     this.logger.info("stopped");
   }
 
-  async handleToolCall(name: string, args: Record<string, unknown>): Promise<ToolCallResult | null> {
-    if (name === "gitlab_reply") {
-      const { project_id, mr_iid, issue_iid, text } = args as {
-        project_id: string; mr_iid?: string; issue_iid?: string; text: string;
-      };
-      if (!mr_iid && !issue_iid) {
-        throw new Error("Either mr_iid or issue_iid is required");
-      }
-      const entity = mr_iid ? `merge_requests/${mr_iid}` : `issues/${issue_iid}`;
-      const url = `${this.apiUrl}/projects/${encodeURIComponent(project_id)}/${entity}/notes`;
-      const res = await nodeFetch(url, { method: "POST", headers: this.headers, body: JSON.stringify({ body: text }) });
-      if (!res.ok) {
-        const body = await res.text();
-        this.logger.error({ status: res.status, body, project_id, entity }, "gitlab_reply failed");
-        throw new Error(`GitLab API error ${res.status}: ${body}`);
-      }
-      this.logger.info({ project_id, entity }, "comment posted");
-      return { content: [{ type: "text", text: "Comment posted" }] };
-    }
-
-    if (name === "gitlab_mark_todo_done") {
-      const { todo_id } = args as { todo_id: string };
-      const url = `${this.apiUrl}/todos/${todo_id}/mark_as_done`;
-      const res = await nodeFetch(url, { method: "POST", headers: this.headers });
-      if (!res.ok) {
-        const body = await res.text();
-        this.logger.error({ status: res.status, body, todo_id }, "mark_todo_done failed");
-        throw new Error(`GitLab API error ${res.status}: ${body}`);
-      }
-      this.logger.info({ todo_id }, "todo marked done");
-      return { content: [{ type: "text", text: "Todo marked as done" }] };
-    }
-
-    if (name === "gitlab_watch_pipeline") {
-      const { project_id, ref } = args as { project_id: string; ref: string };
-      const existing = this.stmts.getWatch.get(project_id, ref) as { project_id: string } | undefined;
-      if (existing) {
-        this.logger.debug({ project_id, ref }, "duplicate watch rejected");
-        return { content: [{ type: "text", text: `Already watching branch "${ref}" on project ${project_id}` }] };
-      }
-      this.stmts.insertWatch.run(project_id, ref, null, Date.now());
-      this.logger.info({ project_id, ref }, "watch started");
-      if (this.onWatchRegistered) {
-        this.onWatchRegistered({
-          watch_type: "pipeline-chain",
-          entity_type: "pipeline",
-          entity_ref: `gitlab:${project_id}:ref:${ref}`,
-          correlation_key: `gitlab:${project_id}:ref:${ref}`,
-          expires_at: Date.now() + this.watchTimeoutMs,
-        });
-      }
-      return { content: [{ type: "text", text: `Watching pipeline on branch "${ref}" for project ${project_id}. Will notify when it finishes.` }] };
-    }
-
+  async handleToolCall(_name: string, _args: Record<string, unknown>): Promise<ToolCallResult | null> {
     return null;
   }
 
@@ -439,7 +350,7 @@ export class GitLabChannelPlugin implements ChannelPlugin {
                 entity_type: "pipeline",
                 entity_ref: `gitlab:${project.id}:pipeline:${pipeline.id}`,
                 correlation_key: `gitlab:${project.id}:ref:${pipeline.ref}`,
-                dedup_key: `gitlab:pipeline:${pipeline.id}:${pipeline.status}`,
+                dedup_key: `gitlab:pipeline:${pipeline.id}:${pipeline.status}:${pipeline.updated_at}`,
                 importance_hint: TERMINAL_STATUSES.has(pipeline.status)
                   ? (pipeline.status === "failed" ? "high" : "normal")
                   : "low",
@@ -476,7 +387,7 @@ export class GitLabChannelPlugin implements ChannelPlugin {
             entity_type: "pipeline",
             entity_ref: `gitlab:${watch.project_id}:ref:${watch.ref}`,
             correlation_key: `gitlab:${watch.project_id}:ref:${watch.ref}`,
-            dedup_key: `gitlab:watch_expired:${watch.project_id}:${watch.ref}:${Date.now()}`,
+            dedup_key: `gitlab:watch_expired:${watch.project_id}:${watch.ref}:${watch.started_at}`,
             importance_hint: "normal",
           },
         });
@@ -514,7 +425,7 @@ export class GitLabChannelPlugin implements ChannelPlugin {
               entity_type: "pipeline",
               entity_ref: `gitlab:${watch.project_id}:pipeline:${latest.id}`,
               correlation_key: `gitlab:${watch.project_id}:ref:${watch.ref}`,
-              dedup_key: `gitlab:pipeline_watch:${latest.id}:${latest.status}`,
+              dedup_key: `gitlab:pipeline_watch:${latest.id}:${latest.status}:${latest.updated_at}`,
               importance_hint: latest.status === "failed" ? "high" : "normal",
               source_ref: latest.web_url,
               title_hint: `Pipeline #${latest.id} on "${watch.ref}": ${latest.status}`,

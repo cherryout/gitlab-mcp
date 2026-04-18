@@ -230,9 +230,9 @@ export interface OrchestratorStmts {
   listWatchesBySession: Database.Statement;
   updateWatchStatus: Database.Statement;
   getActiveWatchesByEntity: Database.Statement;
+  getActiveWatchInSession: Database.Statement;
   getActiveWatchesByCorrelation: Database.Statement;
   expireStaleWatches: Database.Statement;
-  findFallbackSession: Database.Statement;
 
   insertEvent: Database.Statement;
   getEventByDedup: Database.Statement;
@@ -283,7 +283,7 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
     updateSessionStatus: db.prepare("UPDATE sessions SET status = ?, last_seen_at = ? WHERE session_id = ?"),
     updateSessionLastSeen: db.prepare("UPDATE sessions SET last_seen_at = ? WHERE session_id = ?"),
     listSessions: db.prepare("SELECT * FROM sessions WHERE status IN ('active', 'resumable') ORDER BY last_seen_at DESC"),
-    findResumableSession: db.prepare("SELECT * FROM sessions WHERE owner = ? AND status = 'resumable' ORDER BY last_seen_at DESC LIMIT 1"),
+    findResumableSession: db.prepare("SELECT * FROM sessions WHERE owner = ? AND status IN ('resumable', 'active') ORDER BY last_seen_at DESC LIMIT 1"),
     detachAllRuntimes: db.prepare("UPDATE runtime_attachments SET attached = 0 WHERE session_id = ? AND attached = 1"),
     detachStaleRuntimes: db.prepare("UPDATE runtime_attachments SET attached = 0 WHERE attached = 1 AND last_heartbeat_at < ?"),
 
@@ -303,9 +303,9 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
     listWatchesBySession: db.prepare("SELECT * FROM watches WHERE session_id = ? AND status = 'active' ORDER BY created_at DESC"),
     updateWatchStatus: db.prepare("UPDATE watches SET status = ?, updated_at = ? WHERE watch_id = ?"),
     getActiveWatchesByEntity: db.prepare("SELECT * FROM watches WHERE entity_type = ? AND entity_ref = ? AND status = 'active'"),
+    getActiveWatchInSession: db.prepare("SELECT * FROM watches WHERE session_id = ? AND entity_type = ? AND entity_ref = ? AND status = 'active' LIMIT 1"),
     getActiveWatchesByCorrelation: db.prepare("SELECT * FROM watches WHERE correlation_key = ? AND status = 'active'"),
     expireStaleWatches: db.prepare("UPDATE watches SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at < ?"),
-    findFallbackSession: db.prepare("SELECT * FROM sessions WHERE status = 'active' AND role IN ('main', 'ops') ORDER BY role ASC, last_seen_at DESC LIMIT 1"),
 
     insertEvent: db.prepare(`
       INSERT INTO events (event_id, source, event_kind, source_ref, thread_ref, actor_ref, title_hint, importance_hint, dedup_key, correlation_key, raw_payload_ref, normalized_json, created_at)

@@ -13,7 +13,6 @@ import { pino } from "pino";
 import type {
   ChannelPlugin,
   ChannelNotification,
-  ToolDef,
 } from "./channel-plugin.js";
 import { Orchestrator } from "./orchestrator.js";
 import { getOrchestratorTools, handleOrchestratorToolCall } from "./orchestrator-mcp.js";
@@ -68,7 +67,6 @@ let activeRuntimeId: string | null = null;
 interface PluginEntry {
   plugin: ChannelPlugin;
   active: boolean;
-  eventFilter: Set<string> | null;
 }
 
 const registry = new Map<string, PluginEntry>();
@@ -80,57 +78,9 @@ for (const name of pluginNames) {
     throw new Error(`Unknown channel plugin: ${name}`);
   }
   const plugin = await factory();
-  registry.set(name, { plugin, active: false, eventFilter: null });
+  registry.set(name, { plugin, active: false });
   logger.info({ name }, "plugin loaded");
 }
-
-// ─── Hub Tools (source multiplexing) ─────────────────────────────────
-
-const hubTools: ToolDef[] = [
-  {
-    name: "hub_subscribe",
-    description:
-      "Subscribe to a source plugin to start receiving events. Available plugins: " +
-      pluginNames.join(", "),
-    inputSchema: {
-      type: "object",
-      properties: {
-        plugin: {
-          type: "string",
-          description: `Plugin name: ${pluginNames.join(", ")}`,
-        },
-        events: {
-          type: "array",
-          items: { type: "string" },
-          description: "Event types to receive (e.g. [\"todo_created\", \"pipeline_watch_completed\"]). Omit for all events.",
-        },
-      },
-      required: ["plugin"],
-    },
-  },
-  {
-    name: "hub_unsubscribe",
-    description: "Unsubscribe from a source plugin (stop receiving events)",
-    inputSchema: {
-      type: "object",
-      properties: {
-        plugin: {
-          type: "string",
-          description: "Plugin name to unsubscribe from",
-        },
-      },
-      required: ["plugin"],
-    },
-  },
-  {
-    name: "hub_status",
-    description: "Show status of all source plugins and orchestrator session",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-];
 
 // ─── MCP Server ──────────────────────────────────────────────────────
 
@@ -143,14 +93,9 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `Session orchestrator with source multiplexing: ${pluginNames.join(", ")}.
+    instructions: `Session orchestrator with source adapters: ${pluginNames.join(", ")}.
 Events arrive as <channel source="orchestrator" plugin="..." event_type="..." ...>.
 Events are diff-based — you only receive CHANGES.
-
-Source plugin tools:
-- hub_subscribe: activate a source plugin to start receiving events
-- hub_unsubscribe: deactivate a source plugin
-- hub_status: show all plugins and orchestrator session state
 
 Orchestrator tools (session & watch management):
 - add_watch: watch an entity (pipeline, MR, thread) — matching events route to your session
@@ -164,7 +109,7 @@ Orchestrator tools (session & watch management):
 Session is auto-managed: created on first startup, resumed on reconnect.
 Watches survive session restarts — events queue while you're away, replay on resume.
 
-Plugin tools are available once the plugin is subscribed.
+Source plugins (auto-started):
 ${pluginList.map((p) => `[${p.name}]\n  events: ${p.eventTypes.map((e) => e.name).join(", ")}\n  tools: ${p.tools.map((t) => t.name).join(", ")}`).join("\n")}`,
   },
 );
@@ -185,15 +130,10 @@ const makeNotify =
   (entry: PluginEntry) =>
   async (n: ChannelNotification): Promise<void> => {
     if (!entry.active) return;
-    const eventType = n.meta.event_type;
-    if (entry.eventFilter && !entry.eventFilter.has(eventType)) {
-      logger.debug({ plugin: entry.plugin.name, eventType, filtered: true }, "event filtered out");
-      return;
-    }
 
     const result = orchestrator.ingestEvent(n);
     logger.debug(
-      { plugin: entry.plugin.name, eventType, eventId: result.eventId, deduplicated: result.deduplicated, matchedWatches: result.matchedWatches },
+      { plugin: entry.plugin.name, eventType: n.meta.event_type, eventId: result.eventId, deduplicated: result.deduplicated, matchedWatches: result.matchedWatches },
       "event ingested",
     );
 
@@ -204,116 +144,37 @@ const makeNotify =
       }
     }
 
-    if (result.matchedWatches === 0) {
-      const importance = n.orchestration?.importance_hint || "normal";
-      if ((importance === "high" || importance === "critical") && !result.deduplicated) {
-        orchestrator.routeToFallback(n, result.eventId);
-      } else {
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: n.content,
-            meta: { plugin: entry.plugin.name, ...n.meta },
-          },
-        });
-      }
-    }
+    // No watch = no delivery. Session gets only what it explicitly watches.
   };
 
 for (const [, entry] of registry) {
   await entry.plugin.init(makeNotify(entry));
-  if (entry.plugin.setOnWatchRegistered) {
-    entry.plugin.setOnWatchRegistered((watch) => {
-      if (!activeSessionId) return;
-      orchestrator.addWatch({
-        session_id: activeSessionId,
-        ...watch,
-      });
-      logger.info({ plugin: entry.plugin.name, entityRef: watch.entity_ref }, "orchestrator watch created from plugin");
-    });
-  }
-  logger.info(
-    { name: entry.plugin.name, tools: entry.plugin.tools.length },
-    "plugin initialized",
-  );
+  logger.info({ name: entry.plugin.name }, "plugin initialized");
 }
 
 // ─── Tool Handlers ───────────────────────────────────────────────────
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => {
-  const activeTools = [...registry.values()]
-    .filter((e) => e.active)
-    .flatMap((e) => e.plugin.tools);
-  return { tools: [...hubTools, ...getOrchestratorTools(), ...activeTools] };
+  return { tools: getOrchestratorTools() };
 });
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
   logger.info({ tool: name }, "tool call");
 
-  // ── Hub tools ──
-  if (name === "hub_subscribe") {
-    const pluginName = (args as { plugin: string }).plugin;
-    const entry = registry.get(pluginName);
-    if (!entry) {
-      return { content: [{ type: "text" as const, text: `Unknown plugin "${pluginName}". Available: ${pluginNames.join(", ")}` }] };
+  const orchResult = await handleOrchestratorToolCall(orchestrator, name, (args as Record<string, unknown>) || {}, activeSessionId!);
+  if (orchResult) {
+    if (name === "add_watch" && (args as Record<string, unknown>).watch_type === "pipeline-chain") {
+      const entityRef = (args as Record<string, unknown>).entity_ref as string;
+      const match = entityRef.match(/^gitlab:([^:]+):ref:(.+)$/);
+      if (match) {
+        const gitlabEntry = registry.get("gitlab");
+        if (gitlabEntry?.active && "startPipelineWatch" in gitlabEntry.plugin) {
+          (gitlabEntry.plugin as { startPipelineWatch: (p: string, r: string) => boolean }).startPipelineWatch(match[1], match[2]);
+        }
+      }
     }
-    const events = (args as { events?: string[] }).events;
-    const filter = events ? new Set(events) : null;
-
-    if (entry.active) {
-      entry.eventFilter = filter;
-      logger.info({ plugin: pluginName, events: events || "all" }, "event filter updated");
-      return {
-        content: [{ type: "text" as const, text: filter
-          ? `Updated "${pluginName}" filter to: ${[...filter].join(", ")}`
-          : `Updated "${pluginName}" to receive all events` }],
-      };
-    }
-    entry.active = true;
-    entry.eventFilter = filter;
-    await entry.plugin.start();
-    logger.info({ plugin: pluginName, events: events || "all" }, "subscribed");
-    const filterInfo = filter ? ` Filtering: ${[...filter].join(", ")}` : "";
-    return {
-      content: [{ type: "text" as const, text: `Subscribed to "${pluginName}".${filterInfo} Tools: ${entry.plugin.tools.map((t) => t.name).join(", ")}` }],
-    };
-  }
-
-  if (name === "hub_unsubscribe") {
-    const pluginName = (args as { plugin: string }).plugin;
-    const entry = registry.get(pluginName);
-    if (!entry) return { content: [{ type: "text" as const, text: `Unknown plugin "${pluginName}"` }] };
-    if (!entry.active) return { content: [{ type: "text" as const, text: `Not subscribed to "${pluginName}"` }] };
-    entry.active = false;
-    await entry.plugin.stop();
-    logger.info({ plugin: pluginName }, "unsubscribed");
-    return { content: [{ type: "text" as const, text: `Unsubscribed from "${pluginName}". Events stopped.` }] };
-  }
-
-  if (name === "hub_status") {
-    const lines = [...registry.entries()].map(([n, e]) => {
-      const status = e.active ? "active" : "inactive";
-      const tools = e.plugin.tools.map((t) => t.name).join(", ");
-      const events = e.plugin.eventTypes.map((et) => et.name).join(", ");
-      const filterInfo = e.eventFilter ? `filter: ${[...e.eventFilter].join(", ")}` : "filter: all";
-      return `${n}: ${status} | ${filterInfo}\n  events: ${events}\n  tools: ${tools}`;
-    });
-    const sessionInfo = activeSessionId
-      ? `\nSession: ${activeSessionId}\nRuntime: ${activeRuntimeId || "none"}`
-      : "\nSession: none";
-    return { content: [{ type: "text" as const, text: lines.join("\n\n") + sessionInfo }] };
-  }
-
-  // ── Orchestrator tools ──
-  const orchResult = await handleOrchestratorToolCall(orchestrator, name, (args as Record<string, unknown>) || {});
-  if (orchResult) return orchResult;
-
-  // ── Plugin tools ──
-  for (const [, entry] of registry) {
-    if (!entry.active) continue;
-    const result = await entry.plugin.handleToolCall(name, (args as Record<string, unknown>) || {});
-    if (result) return result;
+    return orchResult;
   }
 
   logger.warn({ name }, "unknown tool");
@@ -332,7 +193,6 @@ const { session, resumed } = orchestrator.findOrCreateSession(SESSION_OWNER, {
   role: SESSION_ROLE,
 });
 activeSessionId = session.session_id;
-orchestrator.setFallbackSession(activeSessionId);
 logger.info({ sessionId: activeSessionId, resumed }, "session ready");
 
 const runtime = orchestrator.attachRuntime(activeSessionId, undefined, "stdio");

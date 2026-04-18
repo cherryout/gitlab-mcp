@@ -10,7 +10,8 @@
       "WebFetch",
       "SlashCommand",
       "mcp__jenkins-int__search_jobs",
-      "mcp__jenkins-int__get_all_jobs"
+      "mcp__jenkins-int__get_all_jobs",
+      "mcp__mermaid__generate_mermaid_diagram"
     ],
     "deny": [
       "Bash(git push:*)",

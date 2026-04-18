@@ -65,6 +65,17 @@ async function run() {
   const watches = orchestrator.listWatches(session.session_id);
   assert(watches.length === 1, "1 active watch listed");
 
+  // Duplicate watch — should return existing, not create new
+  const dupWatch = orchestrator.addWatch({
+    session_id: session.session_id,
+    watch_type: "pipeline-chain",
+    entity_type: "pipeline",
+    entity_ref: "gitlab:123:pipeline:456",
+  });
+  assert(dupWatch.watch_id === watch.watch_id, "duplicate add_watch returns existing watch");
+  const watchesAfterDup = orchestrator.listWatches(session.session_id);
+  assert(watchesAfterDup.length === 1, "still only 1 watch after duplicate add");
+
   // 5. Ingest event matching by entity_ref
   console.log("\n--- Event Ingestion (entity match) ---");
   const result1 = orchestrator.ingestEvent({
@@ -330,51 +341,8 @@ async function run() {
     delivered3.push({ sessionId, content, meta });
   });
 
-  console.log("\n--- Phase 3: Fallback routing (critical unmatched) ---");
   const mainSession = orch3.registerSession({ session_name: "main", role: "main", owner: "test" });
-  const mainRt = orch3.attachRuntime(mainSession.session_id);
-  orch3.setFallbackSession(mainSession.session_id);
-
-  const criticalNotification = {
-    content: "Pipeline #999 FAILED on production",
-    meta: { event_type: "pipeline_status_changed", plugin: "gitlab" },
-    orchestration: {
-      source: "gitlab",
-      event_kind: "pipeline_status_changed",
-      entity_type: "pipeline",
-      entity_ref: "gitlab:critical:pipeline:999",
-      importance_hint: "critical" as const,
-      title_hint: "Pipeline #999 FAILED on production",
-      dedup_key: "fallback-critical-event",
-    },
-  };
-  const criticalIngest = orch3.ingestEvent(criticalNotification);
-  const fallbackResult = orch3.routeToFallback(criticalNotification, criticalIngest.eventId);
-  assert(fallbackResult !== null, "fallback routing returned decision");
-  assert(fallbackResult!.mode === "live", "fallback delivered live (runtime attached)");
-  assert(fallbackResult!.sessionId === mainSession.session_id, "fallback routed to main session");
-  assert(delivered3.length === 1, "fallback notification sent");
-  assert(delivered3[0].meta.fallback === "true", "fallback flag in meta");
-
-  console.log("\n--- Phase 3: Fallback routing (detached) ---");
-  orch3.detachRuntime(mainRt.runtime_id);
-  const eventId2 = orch3.ingestEvent({
-    content: "dummy event for fallback test",
-    meta: { event_type: "test", plugin: "test" },
-    orchestration: { source: "test", event_kind: "test", dedup_key: "fallback-test-event" },
-  }).eventId;
-
-  const fallbackQueued = orch3.routeToFallback(
-    {
-      content: "Build FAILURE on production",
-      meta: { event_type: "build_completed", plugin: "jenkins" },
-      orchestration: { source: "jenkins", event_kind: "build_completed", importance_hint: "high" },
-    },
-    eventId2,
-  );
-  assert(fallbackQueued !== null, "fallback queued when detached");
-  assert(fallbackQueued!.mode === "queued", "fallback mode is queued");
-  assert(delivered3.length === 1, "no live notification when detached");
+  orch3.attachRuntime(mainSession.session_id);
 
   console.log("\n--- Phase 3: Watch auto-complete ---");
   orch3.attachRuntime(mainSession.session_id);
@@ -442,6 +410,63 @@ async function run() {
   assert(digestText.includes("[replay"), "digest has replay marker");
 
   orch3.close();
+
+  // ─── Crash Recovery Test ────────────────────────────────────────────
+
+  console.log("\n--- Crash Recovery: session stays active after hard kill ---");
+  const orch4 = new Orchestrator({ dbPath });
+  const crashSession = orch4.registerSession({ session_name: "crash-test", owner: "crashuser", role: "bugfix" });
+  const crashRt = orch4.attachRuntime(crashSession.session_id);
+  const crashWatch = orch4.addWatch({
+    session_id: crashSession.session_id,
+    watch_type: "pipeline-chain",
+    entity_type: "pipeline",
+    entity_ref: "gitlab:crash:ref:main",
+    correlation_key: "gitlab:crash:ref:main",
+  });
+
+  // Simulate hard kill: just close DB without markSessionResumable
+  orch4.close();
+
+  // New process starts — session is still "active" in DB, runtime still "attached"
+  const orch5 = new Orchestrator({ dbPath });
+  const { session: recovered, resumed: wasResumed } = orch5.findOrCreateSession("crashuser");
+  assert(wasResumed, "crash recovery: session was resumed");
+  assert(recovered.session_id === crashSession.session_id, "crash recovery: same session ID");
+  assert(recovered.status === "active", "crash recovery: status is active");
+
+  const recoveredWatches = orch5.listWatches(recovered.session_id);
+  assert(recoveredWatches.length === 1, "crash recovery: watch survived");
+  assert(recoveredWatches[0].entity_ref === "gitlab:crash:ref:main", "crash recovery: correct watch");
+
+  // Events queued during "dead" period should work
+  orch5.ingestEvent({
+    content: "Pipeline failed while process was dead",
+    meta: { event_type: "pipeline_status_changed", plugin: "gitlab" },
+    orchestration: {
+      source: "gitlab",
+      event_kind: "pipeline_status_changed",
+      entity_type: "pipeline",
+      entity_ref: "gitlab:crash:pipeline:999",
+      correlation_key: "gitlab:crash:ref:main",
+      dedup_key: "crash-recovery-event-1",
+      importance_hint: "high",
+    },
+  });
+
+  // After findOrCreateSession detached old runtimes, this should be queued
+  const crashPending = orch5.listPendingDeliveries(recovered.session_id);
+  assert(crashPending.length === 1, "crash recovery: event queued for recovered session");
+
+  // Attach new runtime and replay
+  orch5.attachRuntime(recovered.session_id);
+  const crashReplayed: string[] = [];
+  await orch5.replayOnResume(recovered.session_id, async (content) => {
+    crashReplayed.push(content);
+  });
+  assert(crashReplayed.length === 1, "crash recovery: pending replayed on new runtime");
+
+  orch5.close();
 
   try { unlinkSync(dbPath); } catch {}
 
