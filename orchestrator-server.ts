@@ -149,13 +149,26 @@ const makeNotify =
 
 for (const [, entry] of registry) {
   await entry.plugin.init(makeNotify(entry));
-  logger.info({ name: entry.plugin.name }, "plugin initialized");
+  if (entry.plugin.setOnWatchRegistered) {
+    entry.plugin.setOnWatchRegistered((watch) => {
+      if (!activeSessionId) return;
+      orchestrator.addWatch({
+        session_id: activeSessionId,
+        ...watch,
+      });
+      logger.info({ plugin: entry.plugin.name, entityRef: watch.entity_ref }, "orchestrator watch created from plugin tool");
+    });
+  }
+  logger.info({ name: entry.plugin.name, tools: entry.plugin.tools.length }, "plugin initialized");
 }
 
 // ─── Tool Handlers ───────────────────────────────────────────────────
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: getOrchestratorTools() };
+  const pluginTools = [...registry.values()]
+    .filter((e) => e.active)
+    .flatMap((e) => e.plugin.tools);
+  return { tools: [...getOrchestratorTools(), ...pluginTools] };
 });
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -175,6 +188,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
     return orchResult;
+  }
+
+  for (const [, entry] of registry) {
+    if (!entry.active) continue;
+    const result = await entry.plugin.handleToolCall(name, (args as Record<string, unknown>) || {});
+    if (result) return result;
   }
 
   logger.warn({ name }, "unknown tool");

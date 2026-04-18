@@ -2,6 +2,7 @@ import type {
   ChannelPlugin,
   EventTypeDef,
   NotifyFn,
+  OnWatchRegisteredFn,
   ToolDef,
   ToolCallResult,
 } from "../channel-plugin.js";
@@ -46,9 +47,23 @@ export class JenkinsChannelPlugin implements ChannelPlugin {
     { name: "build_completed", description: "Build finished (SUCCESS, FAILURE, UNSTABLE, ABORTED)" },
   ];
 
-  readonly tools: ToolDef[] = [];
+  readonly tools: ToolDef[] = [
+    {
+      name: "jenkins_watch_job",
+      description: "Watch a Jenkins job. Routes build_started and build_completed events for this job to the session. The next completed build is typically your deploy. Use mcp__jenkins-int__search_jobs or get_all_jobs to find job paths.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          job_path: { type: "string", description: "Job path (e.g. 'SDK/deploy_sdk_int', 'Processing/deploy_processing_int')" },
+          expires_in_hours: { type: "number", description: "Expiration in hours (default: 2)" },
+        },
+        required: ["job_path"],
+      },
+    },
+  ];
 
   private notify!: NotifyFn;
+  private onWatchRegistered?: OnWatchRegisteredFn;
   private db!: Database.Database;
   private stmts!: Stmts;
   private logger!: pino.Logger;
@@ -129,6 +144,10 @@ export class JenkinsChannelPlugin implements ChannelPlugin {
     }, "jenkins plugin initialized");
   }
 
+  setOnWatchRegistered(fn: OnWatchRegisteredFn): void {
+    this.onWatchRegistered = fn;
+  }
+
   async start() {
     this.logger.info("starting poll loop");
     this.schedulePoll();
@@ -140,7 +159,29 @@ export class JenkinsChannelPlugin implements ChannelPlugin {
     this.logger.info("stopped");
   }
 
-  async handleToolCall(_name: string, _args: Record<string, unknown>): Promise<ToolCallResult | null> {
+  async handleToolCall(name: string, args: Record<string, unknown>): Promise<ToolCallResult | null> {
+    if (name === "jenkins_watch_job") {
+      const jobPath = args.job_path as string;
+      const expiresInHours = (args.expires_in_hours as number) ?? 2;
+      if (!this.onWatchRegistered) {
+        return { content: [{ type: "text", text: "Error: orchestrator callback not configured" }] };
+      }
+      if (!this.watchJobs.includes(jobPath)) {
+        this.logger.warn({ jobPath, configured: this.watchJobs }, "watching unconfigured job (plugin won't poll it)");
+      }
+      this.onWatchRegistered({
+        watch_type: "deploy-chain",
+        entity_type: "build",
+        entity_ref: `jenkins:${jobPath}`,
+        correlation_key: `jenkins:${jobPath}`,
+        expires_at: Date.now() + expiresInHours * 60 * 60 * 1000,
+      });
+      this.logger.info({ jobPath, expiresInHours }, "jenkins job watch registered");
+      const warning = this.watchJobs.includes(jobPath)
+        ? ""
+        : " (note: this job is not in JENKINS_CHANNEL_JOBS — plugin won't emit events for it until configured)";
+      return { content: [{ type: "text", text: `Watching Jenkins job "${jobPath}". Next build_completed event routes here.${warning}` }] };
+    }
     return null;
   }
 

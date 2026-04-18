@@ -2,6 +2,7 @@ import type {
   ChannelPlugin,
   EventTypeDef,
   NotifyFn,
+  OnWatchRegisteredFn,
   ToolDef,
   ToolCallResult,
 } from "../channel-plugin.js";
@@ -9,6 +10,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { execSync } from "child_process";
 import nodeFetch from "node-fetch";
 import { pino } from "pino";
 
@@ -70,9 +72,46 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     { name: "pipeline_watch_expired", description: "Pipeline watch timed out (30 min)" },
   ];
 
-  readonly tools: ToolDef[] = [];
+  readonly tools: ToolDef[] = [
+    {
+      name: "gitlab_watch_branch",
+      description: "Watch a GitLab pipeline on a specific branch. Routes pipeline events to this session. Auto-expires in 2h.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: { type: "string", description: "Project path (e.g. 'banking/sdk.finance-backend')" },
+          ref: { type: "string", description: "Branch name (e.g. 'int', 'main')" },
+          expires_in_hours: { type: "number", description: "Expiration in hours (default: 2)" },
+        },
+        required: ["project", "ref"],
+      },
+    },
+    {
+      name: "gitlab_watch_mr",
+      description: "Watch a GitLab merge request. Routes comments, approvals, and pipeline events for that MR to this session.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          project: { type: "string", description: "Project path (e.g. 'banking/sdk.finance-backend')" },
+          iid: { type: "number", description: "MR internal ID" },
+        },
+        required: ["project", "iid"],
+      },
+    },
+    {
+      name: "gitlab_watch_current_branch",
+      description: "Watch the pipeline on the current git branch. Reads project path and branch from the working directory's git context. No arguments needed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          expires_in_hours: { type: "number", description: "Expiration in hours (default: 2)" },
+        },
+      },
+    },
+  ];
 
   private notify!: NotifyFn;
+  private onWatchRegistered?: OnWatchRegisteredFn;
   private db!: Database.Database;
   private stmts!: Stmts;
   private logger!: pino.Logger;
@@ -163,6 +202,10 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     this.logger.info({ api: this.apiUrl, pollInterval: this.pollIntervalMs, namespace: this.namespaceFilter || "(all)", dbPath, logPath }, "gitlab plugin initialized");
   }
 
+  setOnWatchRegistered(fn: OnWatchRegisteredFn): void {
+    this.onWatchRegistered = fn;
+  }
+
   startPipelineWatch(projectId: string, ref: string): boolean {
     const existing = this.stmts.getWatch.get(projectId, ref) as { project_id: string } | undefined;
     if (existing) return false;
@@ -184,7 +227,78 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     this.logger.info("stopped");
   }
 
-  async handleToolCall(_name: string, _args: Record<string, unknown>): Promise<ToolCallResult | null> {
+  async handleToolCall(name: string, args: Record<string, unknown>): Promise<ToolCallResult | null> {
+    if (name === "gitlab_watch_branch") {
+      const project = args.project as string;
+      const ref = args.ref as string;
+      const expiresInHours = (args.expires_in_hours as number) ?? 2;
+      return this.createBranchWatch(project, ref, expiresInHours);
+    }
+
+    if (name === "gitlab_watch_mr") {
+      const project = args.project as string;
+      const iid = args.iid as number;
+      if (!this.onWatchRegistered) {
+        return { content: [{ type: "text", text: "Error: orchestrator callback not configured" }] };
+      }
+      this.onWatchRegistered({
+        watch_type: "merge-request",
+        entity_type: "merge_request",
+        entity_ref: `gitlab:${project}:mr:${iid}`,
+        correlation_key: `gitlab:${project}:mr:${iid}`,
+      });
+      this.logger.info({ project, iid }, "mr watch registered");
+      return { content: [{ type: "text", text: `Watching MR !${iid} on ${project}. Comments, approvals, and pipeline events will route to this session.` }] };
+    }
+
+    if (name === "gitlab_watch_current_branch") {
+      const expiresInHours = (args.expires_in_hours as number) ?? 2;
+      try {
+        const remoteUrl = execSync("git config --get remote.origin.url", { encoding: "utf-8" }).trim();
+        const branch = execSync("git branch --show-current", { encoding: "utf-8" }).trim();
+        const project = this.parseGitLabProject(remoteUrl);
+        if (!project) {
+          return { content: [{ type: "text", text: `Error: could not parse GitLab project from remote URL: ${remoteUrl}` }] };
+        }
+        if (!branch) {
+          return { content: [{ type: "text", text: "Error: no current branch (detached HEAD?)" }] };
+        }
+        return this.createBranchWatch(project, branch, expiresInHours);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text", text: `Error reading git context: ${msg}` }] };
+      }
+    }
+
+    return null;
+  }
+
+  private createBranchWatch(project: string, ref: string, expiresInHours: number): ToolCallResult {
+    if (!this.onWatchRegistered) {
+      return { content: [{ type: "text", text: "Error: orchestrator callback not configured" }] };
+    }
+    this.startPipelineWatch(project, ref);
+    this.onWatchRegistered({
+      watch_type: "pipeline-chain",
+      entity_type: "pipeline",
+      entity_ref: `gitlab:${project}:ref:${ref}`,
+      correlation_key: `gitlab:${project}:ref:${ref}`,
+      expires_at: Date.now() + expiresInHours * 60 * 60 * 1000,
+    });
+    this.logger.info({ project, ref, expiresInHours }, "branch watch registered");
+    return { content: [{ type: "text", text: `Watching pipeline on branch "${ref}" for project ${project}. Expires in ${expiresInHours}h.` }] };
+  }
+
+  private parseGitLabProject(remoteUrl: string): string | null {
+    // git@host:namespace/project.git OR https://host/namespace/project.git
+    const sshMatch = remoteUrl.match(/:(.+?)(?:\.git)?$/);
+    if (remoteUrl.startsWith("git@") && sshMatch) {
+      return sshMatch[1].replace(/\.git$/, "");
+    }
+    const httpsMatch = remoteUrl.match(/https?:\/\/[^/]+\/(.+?)(?:\.git)?$/);
+    if (httpsMatch) {
+      return httpsMatch[1].replace(/\.git$/, "");
+    }
     return null;
   }
 

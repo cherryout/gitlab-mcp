@@ -2,6 +2,7 @@ import type {
   ChannelPlugin,
   EventTypeDef,
   NotifyFn,
+  OnWatchRegisteredFn,
   ToolDef,
   ToolCallResult,
 } from "../channel-plugin.js";
@@ -139,9 +140,23 @@ export class SlackChannelPlugin implements ChannelPlugin {
     { name: "thread_reply", description: "Reply in a thread you participate in" },
   ];
 
-  readonly tools: ToolDef[] = [];
+  readonly tools: ToolDef[] = [
+    {
+      name: "slack_watch_thread",
+      description: "Watch a Slack thread. Routes new replies in the thread to this session. Use mcp__slack-iqoption__channels_list to find channel IDs and conversations_history to find message timestamps.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel_id: { type: "string", description: "Slack channel ID (e.g. 'C027LNCUH19')" },
+          thread_ts: { type: "string", description: "Thread parent message timestamp (e.g. '1775119225.778049')" },
+        },
+        required: ["channel_id", "thread_ts"],
+      },
+    },
+  ];
 
   private notify!: NotifyFn;
+  private onWatchRegistered?: OnWatchRegisteredFn;
   private db!: Database.Database;
   private stmts!: Stmts;
   private logger!: pino.Logger;
@@ -269,7 +284,26 @@ export class SlackChannelPlugin implements ChannelPlugin {
     this.logger.info("stopped");
   }
 
-  async handleToolCall(_name: string, _args: Record<string, unknown>): Promise<ToolCallResult | null> {
+  setOnWatchRegistered(fn: OnWatchRegisteredFn): void {
+    this.onWatchRegistered = fn;
+  }
+
+  async handleToolCall(name: string, args: Record<string, unknown>): Promise<ToolCallResult | null> {
+    if (name === "slack_watch_thread") {
+      const channelId = args.channel_id as string;
+      const threadTs = args.thread_ts as string;
+      if (!this.onWatchRegistered) {
+        return { content: [{ type: "text", text: "Error: orchestrator callback not configured" }] };
+      }
+      this.onWatchRegistered({
+        watch_type: "slack-thread",
+        entity_type: "slack_thread",
+        entity_ref: `slack:${channelId}:thread:${threadTs}`,
+        correlation_key: `slack:${channelId}:thread:${threadTs}`,
+      });
+      this.logger.info({ channelId, threadTs }, "slack thread watch registered");
+      return { content: [{ type: "text", text: `Watching Slack thread in channel ${channelId} (ts=${threadTs}). New replies will route here.` }] };
+    }
     return null;
   }
 
