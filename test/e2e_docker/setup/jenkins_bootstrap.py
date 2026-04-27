@@ -125,6 +125,8 @@ def jenkins_request(base_url: str, method: str, path: str,
         body = e.read().decode()
         if e.code in (302, 409):
             return b""
+        if e.code == 400 and ("already exists" in body.lower() or "name is already in use" in body.lower()):
+            return b""
         raise RuntimeError(f"{method} {path} -> {e.code}: {body[:200]}") from e
 
 

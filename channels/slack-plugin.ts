@@ -127,6 +127,8 @@ interface Stmts {
   upsertChannel: Database.Statement;
   getChannels: Database.Statement;
   getLatestTs: Database.Statement;
+  getMeta: Database.Statement;
+  setMeta: Database.Statement;
 }
 
 // ─── Plugin ───────────────────────────────────────────────────────────
@@ -216,6 +218,9 @@ export class SlackChannelPlugin implements ChannelPlugin {
         discovered_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_messages_channel_ts ON messages(channel_id, ts);
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL
+      );
     `);
 
     this.stmts = {
@@ -232,7 +237,12 @@ export class SlackChannelPlugin implements ChannelPlugin {
       `),
       getChannels: this.db.prepare("SELECT * FROM channels"),
       getLatestTs: this.db.prepare("SELECT MAX(ts) as latest_ts FROM messages WHERE channel_id = ?"),
+      getMeta: this.db.prepare("SELECT value FROM meta WHERE key = ?"),
+      setMeta: this.db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"),
     };
+
+    const seededRow = this.stmts.getMeta.get("seeded") as { value: string } | undefined;
+    this.seeded = seededRow?.value === "1";
 
     this.client = new SlackMCPClient(
       slackCommand,
@@ -374,6 +384,7 @@ export class SlackChannelPlugin implements ChannelPlugin {
 
     if (isFirstRun) {
       this.logger.info("channels seeded (first run, no events emitted)");
+      this.stmts.setMeta.run("seeded", "1");
     }
     this.seeded = true;
   }

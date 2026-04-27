@@ -37,6 +37,8 @@ interface Stmts {
   getJob: Database.Statement;
   upsertJob: Database.Statement;
   getJobs: Database.Statement;
+  getMeta: Database.Statement;
+  setMeta: Database.Statement;
 }
 
 export class JenkinsChannelPlugin implements ChannelPlugin {
@@ -116,6 +118,9 @@ export class JenkinsChannelPlugin implements ChannelPlugin {
         url TEXT NOT NULL,
         discovered_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL
+      );
     `);
 
     this.stmts = {
@@ -133,7 +138,12 @@ export class JenkinsChannelPlugin implements ChannelPlugin {
         ON CONFLICT(path) DO UPDATE SET url=excluded.url
       `),
       getJobs: this.db.prepare("SELECT * FROM jobs"),
+      getMeta: this.db.prepare("SELECT value FROM meta WHERE key = ?"),
+      setMeta: this.db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"),
     };
+
+    const seededRow = this.stmts.getMeta.get("seeded") as { value: string } | undefined;
+    this.seeded = seededRow?.value === "1";
 
     this.logger.info({
       baseUrl: this.baseUrl,
@@ -226,6 +236,7 @@ export class JenkinsChannelPlugin implements ChannelPlugin {
 
     if (isFirstRun) {
       this.logger.info({ jobs: this.watchJobs.length }, "jobs seeded (first run)");
+      this.stmts.setMeta.run("seeded", "1");
     }
     this.seeded = true;
   }

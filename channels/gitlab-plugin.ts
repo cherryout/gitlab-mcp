@@ -59,6 +59,8 @@ interface Stmts {
   updateWatchPipeline: Database.Statement;
   deleteWatch: Database.Statement;
   getAllWatches: Database.Statement;
+  getMeta: Database.Statement;
+  setMeta: Database.Statement;
 }
 
 export class GitLabChannelPlugin implements ChannelPlugin {
@@ -174,6 +176,9 @@ export class GitLabChannelPlugin implements ChannelPlugin {
         project_id TEXT NOT NULL, ref TEXT NOT NULL, pipeline_id INTEGER,
         started_at INTEGER NOT NULL, PRIMARY KEY (project_id, ref)
       );
+      CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL
+      );
     `);
 
     this.stmts = {
@@ -197,7 +202,12 @@ export class GitLabChannelPlugin implements ChannelPlugin {
       updateWatchPipeline: this.db.prepare("UPDATE watches SET pipeline_id = ? WHERE project_id = ? AND ref = ?"),
       deleteWatch: this.db.prepare("DELETE FROM watches WHERE project_id = ? AND ref = ?"),
       getAllWatches: this.db.prepare("SELECT * FROM watches"),
+      getMeta: this.db.prepare("SELECT value FROM meta WHERE key = ?"),
+      setMeta: this.db.prepare("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"),
     };
+
+    const seededRow = this.stmts.getMeta.get("seededTodos") as { value: string } | undefined;
+    this.seededTodos = seededRow?.value === "1";
 
     this.logger.info({ api: this.apiUrl, pollInterval: this.pollIntervalMs, namespace: this.namespaceFilter || "(all)", dbPath, logPath }, "gitlab plugin initialized");
   }
@@ -394,7 +404,10 @@ export class GitLabChannelPlugin implements ChannelPlugin {
         }
       }
 
-      if (isFirstRun) this.logger.info({ seeded: todos.length }, "todos seeded (first run)");
+      if (isFirstRun) {
+        this.logger.info({ seeded: todos.length }, "todos seeded (first run)");
+        this.stmts.setMeta.run("seededTodos", "1");
+      }
       this.seededTodos = true;
     } catch (err) {
       this.logger.error({ err }, "pollTodos error");

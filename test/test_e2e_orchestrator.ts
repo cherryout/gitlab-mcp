@@ -311,7 +311,8 @@ async function testPluginBridge() {
     const mrText = (mrResult.content as { text: string }[])[0].text;
     assert(mrText.includes("Watching MR !42"), "gitlab_watch_mr returns success");
 
-    const watches2 = JSON.parse((await h.client.callTool({ name: "list_watches", arguments: {} })).content[0].text);
+    const watches2Resp = await h.client.callTool({ name: "list_watches", arguments: {} });
+    const watches2 = JSON.parse((watches2Resp.content as { text: string }[])[0].text);
     assert(watches2.length === 2, "2 watches after MR watch");
     assert(watches2.some((w: { entity_ref: string }) => w.entity_ref === "gitlab:banking/test-project:mr:42"), "MR watch present");
 
@@ -428,6 +429,76 @@ async function testProcessRestartPersistence() {
   }
 }
 
+async function testSeededFlagPersistsAcrossRestart() {
+  console.log("\n--- E2E: seeded flag persists across process restart ---");
+  const dbDir = makeDbDir();
+  const mock = await startMockGitLab();
+
+  // Seed a todo before first start
+  mock.state.todos.push({
+    id: 1001, action_name: "mentioned", target_type: "MergeRequest",
+    target: { iid: 1, title: "Existing todo before start" },
+    project: { id: 50, path_with_namespace: "test/seed-test" },
+    author: { username: "alice", name: "Alice" }, body: "test", state: "pending",
+    target_url: "http://fake/todo/1001",
+  });
+
+  const h1 = await startHarness({
+    dbDir, sessionOwner: "e2e-seed",
+    gitlabPort: mock.port, gitlabToken: mock.token,
+  });
+  await sleep(2000);  // let first poll absorb existing todo silently
+  await h1.close();
+
+  // Add a NEW todo while process is dead
+  mock.state.todos.push({
+    id: 1002, action_name: "assigned", target_type: "Issue",
+    target: { iid: 2, title: "Todo that appeared during downtime" },
+    project: { id: 50, path_with_namespace: "test/seed-test" },
+    author: { username: "bob", name: "Bob" }, body: "new", state: "pending",
+    target_url: "http://fake/todo/1002",
+  });
+
+  // Restart — this time the seeded flag should be persisted, so new todo should fire event
+  const h2 = await startHarness({
+    dbDir, sessionOwner: "e2e-seed",
+    gitlabPort: mock.port, gitlabToken: mock.token,
+  });
+
+  // Add watch for that project's todo to capture it
+  await h2.client.callTool({
+    name: "add_watch",
+    arguments: {
+      watch_type: "task-followup",
+      entity_type: "todo",
+      entity_ref: "gitlab:test/seed-test:todo:1002",
+    },
+  });
+
+  await sleep(2500);  // give time for poll after watch is added
+
+  const got = h2.notifications.find(
+    (n) => n.method === "notifications/claude/channel"
+      && String((n.params as { content?: string })?.content || "").includes("1002"),
+  );
+  // Note: the watch was added AFTER the poll might have run; the event should still be ingested
+  // and queued for the watch since dedup_key prevents re-emit. So we check for the event in DB.
+  if (got) {
+    assert(true, "todo_created event delivered after restart (new todo during downtime)");
+  } else {
+    // Fallback: check unmatched events (the event was emitted but possibly before our watch was added)
+    const unmatchedResp = await h2.client.callTool({ name: "list_unmatched_events", arguments: {} });
+    const unmatched = JSON.parse((unmatchedResp.content as { text: string }[])[0].text);
+    const found = unmatched.find((e: { source: string; event_kind: string }) =>
+      e.source === "gitlab" && e.event_kind === "todo_created");
+    assert(!!found, "todo_created event emitted after restart (found in unmatched events)");
+  }
+
+  await h2.close();
+  await new Promise<void>((r) => mock.server.close(() => r()));
+  cleanupDbDir(dbDir);
+}
+
 async function testJenkinsPolling() {
   console.log("\n--- E2E-4: Jenkins polling via mock ---");
   const dbDir = makeDbDir();
@@ -484,6 +555,7 @@ async function main() {
   try { await testPluginBridge(); } catch (e) { failed++; console.log(`  FAIL  testPluginBridge threw: ${e}`); }
   try { await testFullPipelineFlow(); } catch (e) { failed++; console.log(`  FAIL  testFullPipelineFlow threw: ${e}`); }
   try { await testProcessRestartPersistence(); } catch (e) { failed++; console.log(`  FAIL  testProcessRestartPersistence threw: ${e}`); }
+  try { await testSeededFlagPersistsAcrossRestart(); } catch (e) { failed++; console.log(`  FAIL  testSeededFlagPersistsAcrossRestart threw: ${e}`); }
   try { await testJenkinsPolling(); } catch (e) { failed++; console.log(`  FAIL  testJenkinsPolling threw: ${e}`); }
 
   console.log(`\n======================`);
