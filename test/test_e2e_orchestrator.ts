@@ -162,6 +162,7 @@ async function startHarness(opts: HarnessOpts): Promise<Harness> {
     env.GITLAB_API_URL = "http://127.0.0.1:1/api/v4";
     env.GITLAB_PERSONAL_ACCESS_TOKEN = "test";
   }
+  env.GITLAB_PLUGIN_SKIP_VALIDATION = "true";
 
   if (opts.jenkinsPort !== undefined) {
     env.JENKINS_CHANNEL_URL = `http://127.0.0.1:${opts.jenkinsPort}`;

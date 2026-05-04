@@ -30,6 +30,7 @@ async function run() {
   process.env.GITLAB_PERSONAL_ACCESS_TOKEN = "test-token";
   process.env.GITLAB_CHANNEL_DB_PATH = gitlabDbPath;
   process.env.GITLAB_CHANNEL_LOG_PATH = join(tmpdir(), `gitlab-test-${randomUUID()}.log`);
+  process.env.GITLAB_PLUGIN_SKIP_VALIDATION = "true";
 
   const gitlabPlugin = new GitLabChannelPlugin();
   const gitlabWatches: WatchRegistration[] = [];
@@ -100,6 +101,165 @@ async function run() {
 
   await gitlabPlugin.stop();
   try { unlinkSync(gitlabDbPath); } catch {}
+
+  // ─── Project validation (404, auth, canonicalization, suggestions) ──
+  console.log("\n--- GitLab Plugin: project validation ---");
+
+  const validationDbPath = join(tmpdir(), `gitlab-validation-${randomUUID()}.db`);
+  process.env.GITLAB_CHANNEL_DB_PATH = validationDbPath;
+  process.env.GITLAB_CHANNEL_LOG_PATH = join(tmpdir(), `gitlab-validation-${randomUUID()}.log`);
+  process.env.GITLAB_PLUGIN_SKIP_VALIDATION = "false";
+
+  const port = 38000 + Math.floor(Math.random() * 1000);
+  process.env.GITLAB_API_URL = `http://127.0.0.1:${port}/api/v4`;
+
+  const projectsDb: Record<string, { id: number; path_with_namespace: string }> = {
+    "banking%2Famaiz-3.0%2Fsdk.finance-backend": { id: 5950, path_with_namespace: "banking/amaiz-3.0/sdk.finance-backend" },
+    "banking%2Frename-old": { id: 7777, path_with_namespace: "banking/rename-new" },
+  };
+  const branchesByProject: Record<number, string[]> = {
+    5950: ["int", "main", "feature/x"],
+    7777: ["main", "develop"],
+  };
+  const { createServer } = await import("http");
+  let auth401 = false;
+  const mockServer = createServer((req, res) => {
+    if (auth401) { res.statusCode = 401; res.end('{"message":"401 Unauthorized"}'); return; }
+    // /projects/:id/repository/branches/:name
+    const branchOne = req.url?.match(/^\/api\/v4\/projects\/(\d+)\/repository\/branches\/([^?]+)/);
+    if (branchOne) {
+      const pid = parseInt(branchOne[1], 10);
+      const name = decodeURIComponent(branchOne[2]);
+      const branches = branchesByProject[pid] || [];
+      if (branches.includes(name)) {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ name, default: name === "main" }));
+      } else {
+        res.statusCode = 404; res.end('{"message":"404 Branch Not Found"}');
+      }
+      return;
+    }
+    // /projects/:id/repository/branches?search=...
+    const branchSearch = req.url?.match(/^\/api\/v4\/projects\/(\d+)\/repository\/branches\?search=([^&]+)/);
+    if (branchSearch) {
+      const pid = parseInt(branchSearch[1], 10);
+      const q = decodeURIComponent(branchSearch[2]).toLowerCase();
+      const branches = (branchesByProject[pid] || []).filter((b) => b.toLowerCase().includes(q)).slice(0, 5);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(branches.map((name) => ({ name }))));
+      return;
+    }
+    // /projects/:path
+    const proj = req.url?.match(/^\/api\/v4\/projects\/([^/?]+)$/);
+    if (proj && projectsDb[proj[1]]) {
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(projectsDb[proj[1]]));
+      return;
+    }
+    res.statusCode = 404; res.end('{"message":"404 Project Not Found"}');
+  });
+  await new Promise<void>((r) => mockServer.listen(port, "127.0.0.1", r));
+
+  const validatedPlugin = new GitLabChannelPlugin();
+  const validatedWatches: WatchRegistration[] = [];
+  await validatedPlugin.init(async () => {});
+  validatedPlugin.setOnWatchRegistered!((w) => validatedWatches.push(w));
+
+  // Seed cache so suggestions work
+  validatedPlugin["stmts"].upsertProject.run(5950, "banking/amaiz-3.0/sdk.finance-backend", Date.now());
+  validatedPlugin["stmts"].upsertProject.run(6106, "banking/amaiz-3.0/integrations", Date.now());
+
+  // a) 404 → error with suggestion
+  const r404 = await validatedPlugin.handleToolCall("gitlab_watch_branch", {
+    project: "banking/sdk.finance-backend", ref: "int",
+  });
+  const r404Text = r404!.content[0].text;
+  assert(r404Text.startsWith("Error:"), "validation: 404 returns Error");
+  assert(r404Text.includes("not found"), "validation: 404 message mentions 'not found'");
+  assert(r404Text.includes("banking/amaiz-3.0/sdk.finance-backend"), "validation: 404 includes suggestion from cache");
+  assert(validatedWatches.length === 0, "validation: 404 does not register a watch");
+
+  // b) 200 → canonical path used; renamed project resolved through redirect
+  validatedWatches.length = 0;
+  const rRename = await validatedPlugin.handleToolCall("gitlab_watch_branch", {
+    project: "banking/rename-old", ref: "main",
+  });
+  assert(validatedWatches.length === 1, "validation: rename resolved to watch");
+  assert(validatedWatches[0].entity_ref === "gitlab:banking/rename-new:ref:main", "validation: entity_ref uses canonical path, not user input");
+  assert(rRename!.content[0].text.includes("rename-new"), "validation: success message shows canonical path");
+  assert(rRename!.content[0].text.includes('resolved from "banking/rename-old"'), "validation: success message notes resolution");
+
+  // c) Valid path → no resolution note
+  validatedWatches.length = 0;
+  const rValid = await validatedPlugin.handleToolCall("gitlab_watch_branch", {
+    project: "banking/amaiz-3.0/sdk.finance-backend", ref: "int",
+  });
+  assert(validatedWatches.length === 1, "validation: valid path registers watch");
+  assert(validatedWatches[0].entity_ref === "gitlab:banking/amaiz-3.0/sdk.finance-backend:ref:int", "validation: valid path entity_ref correct");
+  assert(!rValid!.content[0].text.includes("resolved from"), "validation: no resolution note on canonical input");
+
+  // d) 401 → distinct error
+  validatedWatches.length = 0;
+  auth401 = true;
+  const r401 = await validatedPlugin.handleToolCall("gitlab_watch_branch", {
+    project: "banking/amaiz-3.0/sdk.finance-backend", ref: "int",
+  });
+  const r401Text = r401!.content[0].text;
+  assert(r401Text.startsWith("Error:"), "validation: 401 returns Error");
+  assert(r401Text.includes("401"), "validation: 401 message includes status");
+  assert(r401Text.includes("GITLAB_PERSONAL_ACCESS_TOKEN"), "validation: 401 message hints at token issue");
+  assert(validatedWatches.length === 0, "validation: 401 does not register a watch");
+  auth401 = false;
+
+  // e) gitlab_watch_mr also validated
+  validatedWatches.length = 0;
+  const rMr404 = await validatedPlugin.handleToolCall("gitlab_watch_mr", {
+    project: "banking/sdk.finance-backend", iid: 99,
+  });
+  assert(rMr404!.content[0].text.startsWith("Error:"), "validation: mr watch on bad path returns Error");
+  assert(validatedWatches.length === 0, "validation: bad-path mr watch does not register");
+
+  // f) Project exists but branch doesn't → 404 with branch suggestions
+  validatedWatches.length = 0;
+  const rBadBranch = await validatedPlugin.handleToolCall("gitlab_watch_branch", {
+    project: "banking/amaiz-3.0/sdk.finance-backend", ref: "intt",
+  });
+  const rBadBranchText = rBadBranch!.content[0].text;
+  assert(rBadBranchText.startsWith("Error:"), "branch validation: missing branch returns Error");
+  assert(rBadBranchText.includes('Branch "intt" not found'), "branch validation: error message mentions the branch");
+  assert(rBadBranchText.includes("int"), "branch validation: suggests close-match branch from API search");
+  assert(validatedWatches.length === 0, "branch validation: bad-branch watch does not register");
+
+  // g) Project + branch both valid → no extra error
+  validatedWatches.length = 0;
+  const rGood = await validatedPlugin.handleToolCall("gitlab_watch_branch", {
+    project: "banking/amaiz-3.0/sdk.finance-backend", ref: "main",
+  });
+  assert(validatedWatches.length === 1, "branch validation: valid project+branch registers watch");
+  assert(rGood!.content[0].text.includes("Watching pipeline"), "branch validation: success message returned");
+
+  await validatedPlugin.stop();
+  await new Promise<void>((r) => mockServer.close(() => r()));
+  try { unlinkSync(validationDbPath); } catch {}
+  delete process.env.GITLAB_API_URL;
+  process.env.GITLAB_PLUGIN_SKIP_VALIDATION = "true";
+
+  // ─── Missing token → fail-fast at construction ──────────────────────
+  console.log("\n--- GitLab Plugin: missing token ---");
+  const tokenBackup = process.env.GITLAB_PERSONAL_ACCESS_TOKEN;
+  delete process.env.GITLAB_PERSONAL_ACCESS_TOKEN;
+  const missingTokenDb = join(tmpdir(), `gitlab-missing-${randomUUID()}.db`);
+  process.env.GITLAB_CHANNEL_DB_PATH = missingTokenDb;
+  let threw = false;
+  try {
+    const p = new GitLabChannelPlugin();
+    await p.init(async () => {});
+  } catch (err) {
+    threw = err instanceof Error && err.message.includes("GITLAB_PERSONAL_ACCESS_TOKEN");
+  }
+  assert(threw, "missing token: throws clear error at startup");
+  process.env.GITLAB_PERSONAL_ACCESS_TOKEN = tokenBackup!;
+  try { unlinkSync(missingTokenDb); } catch {}
 
   // ─── Jenkins Plugin ─────────────────────────────────────────────────
   console.log("\n--- Jenkins Plugin ---");

@@ -133,7 +133,11 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     this.notify = notify;
 
     this.apiUrl = process.env.GITLAB_API_URL || "https://gitlab.com/api/v4";
-    this.token = process.env.GITLAB_PERSONAL_ACCESS_TOKEN!;
+    const token = process.env.GITLAB_PERSONAL_ACCESS_TOKEN;
+    if (!token) {
+      throw new Error("GITLAB_PERSONAL_ACCESS_TOKEN env var is required for gitlab plugin");
+    }
+    this.token = token;
     this.pollIntervalMs = parseInt(process.env.GITLAB_CHANNEL_POLL_INTERVAL || "30000", 10);
     this.watchPollMs = parseInt(process.env.GITLAB_CHANNEL_WATCH_POLL || "10000", 10);
     this.watchTimeoutMs = parseInt(process.env.GITLAB_CHANNEL_WATCH_TIMEOUT || String(30 * 60 * 1000), 10);
@@ -194,7 +198,7 @@ export class GitLabChannelPlugin implements ChannelPlugin {
         INSERT INTO pipelines (id, project_id, status, ref, sha, web_url, updated_at, seen_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at, seen_at=excluded.seen_at
       `),
-      getProjects: this.db.prepare("SELECT id FROM projects"),
+      getProjects: this.db.prepare("SELECT id, path FROM projects"),
       upsertProject: this.db.prepare("INSERT INTO projects (id, path, discovered_at) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET path=excluded.path"),
       projectCount: this.db.prepare("SELECT COUNT(*) as count FROM projects"),
       getWatch: this.db.prepare("SELECT * FROM watches WHERE project_id = ? AND ref = ?"),
@@ -251,14 +255,16 @@ export class GitLabChannelPlugin implements ChannelPlugin {
       if (!this.onWatchRegistered) {
         return { content: [{ type: "text", text: "Error: orchestrator callback not configured" }] };
       }
+      const resolved = await this.resolveProject(project);
+      if (!resolved.ok) return resolved.errorResult;
       this.onWatchRegistered({
         watch_type: "merge-request",
         entity_type: "merge_request",
-        entity_ref: `gitlab:${project}:mr:${iid}`,
-        correlation_key: `gitlab:${project}:mr:${iid}`,
+        entity_ref: `gitlab:${resolved.canonicalPath}:mr:${iid}`,
+        correlation_key: `gitlab:${resolved.canonicalPath}:mr:${iid}`,
       });
-      this.logger.info({ project, iid }, "mr watch registered");
-      return { content: [{ type: "text", text: `Watching MR !${iid} on ${project}. Comments, approvals, and pipeline events will route to this session.` }] };
+      this.logger.info({ project: resolved.canonicalPath, iid }, "mr watch registered");
+      return { content: [{ type: "text", text: `Watching MR !${iid} on ${resolved.canonicalPath}. Comments, approvals, and pipeline events will route to this session.` }] };
     }
 
     if (name === "gitlab_watch_current_branch") {
@@ -283,20 +289,131 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     return null;
   }
 
-  private createBranchWatch(project: string, ref: string, expiresInHours: number): ToolCallResult {
+  private async resolveProject(project: string): Promise<
+    | { ok: true; canonicalPath: string; projectId: number }
+    | { ok: false; errorResult: ToolCallResult }
+  > {
+    if (process.env.GITLAB_PLUGIN_SKIP_VALIDATION === "true") {
+      return { ok: true, canonicalPath: project, projectId: -1 };
+    }
+    try {
+      const url = `${this.apiUrl}/projects/${encodeURIComponent(project)}`;
+      const res = await nodeFetch(url, { headers: this.headers });
+      if (res.status === 404) {
+        const suggestions = this.suggestProjects(project);
+        const hint = suggestions.length > 0
+          ? `\n\nDid you mean:\n  ${suggestions.join("\n  ")}`
+          : "";
+        const msg = `GitLab project "${project}" not found (404). Check spelling or use the full namespaced path (e.g. group/subgroup/project).${hint}`;
+        this.logger.warn({ project }, "watch rejected: project not found");
+        return { ok: false, errorResult: { content: [{ type: "text", text: `Error: ${msg}` }] } };
+      }
+      if (res.status === 401 || res.status === 403) {
+        const msg = `GitLab returned ${res.status} for "${project}" — check GITLAB_PERSONAL_ACCESS_TOKEN scope/validity.`;
+        this.logger.warn({ project, status: res.status }, "watch rejected: auth failure");
+        return { ok: false, errorResult: { content: [{ type: "text", text: `Error: ${msg}` }] } };
+      }
+      if (!res.ok) {
+        const msg = `GitLab returned ${res.status} resolving "${project}".`;
+        return { ok: false, errorResult: { content: [{ type: "text", text: `Error: ${msg}` }] } };
+      }
+      const proj = (await res.json()) as { id: number; path_with_namespace: string };
+      this.stmts.upsertProject.run(proj.id, proj.path_with_namespace, Date.now());
+      return { ok: true, canonicalPath: proj.path_with_namespace, projectId: proj.id };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error({ err, project }, "project resolve failed");
+      return { ok: false, errorResult: { content: [{ type: "text", text: `Error: failed to resolve "${project}": ${msg}` }] } };
+    }
+  }
+
+  private async resolveBranch(projectId: number, projectPath: string, ref: string): Promise<
+    | { ok: true }
+    | { ok: false; errorResult: ToolCallResult }
+  > {
+    if (process.env.GITLAB_PLUGIN_SKIP_VALIDATION === "true") {
+      return { ok: true };
+    }
+    try {
+      const branchUrl = `${this.apiUrl}/projects/${projectId}/repository/branches/${encodeURIComponent(ref)}`;
+      const res = await nodeFetch(branchUrl, { headers: this.headers });
+      if (res.status === 200) return { ok: true };
+      if (res.status === 404) {
+        const suggestions = await this.suggestBranches(projectId, ref);
+        const hint = suggestions.length > 0
+          ? `\n\nDid you mean:\n  ${suggestions.join("\n  ")}`
+          : "";
+        const msg = `Branch "${ref}" not found on project "${projectPath}" (404).${hint}`;
+        this.logger.warn({ projectPath, ref }, "watch rejected: branch not found");
+        return { ok: false, errorResult: { content: [{ type: "text", text: `Error: ${msg}` }] } };
+      }
+      if (res.status === 401 || res.status === 403) {
+        return { ok: false, errorResult: { content: [{ type: "text", text: `Error: GitLab returned ${res.status} resolving branch "${ref}" — check token scope.` }] } };
+      }
+      return { ok: false, errorResult: { content: [{ type: "text", text: `Error: GitLab returned ${res.status} resolving branch "${ref}".` }] } };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error({ err, projectPath, ref }, "branch resolve failed");
+      return { ok: false, errorResult: { content: [{ type: "text", text: `Error: failed to resolve branch "${ref}" on "${projectPath}": ${msg}` }] } };
+    }
+  }
+
+  private async suggestBranches(projectId: number, query: string): Promise<string[]> {
+    try {
+      const url = `${this.apiUrl}/projects/${projectId}/repository/branches?search=${encodeURIComponent(query)}&per_page=5`;
+      const res = await nodeFetch(url, { headers: this.headers });
+      if (!res.ok) return [];
+      const branches = (await res.json()) as Array<{ name: string }>;
+      return branches.map((b) => b.name).slice(0, 5);
+    } catch {
+      return [];
+    }
+  }
+
+  private suggestProjects(query: string): string[] {
+    const known = this.db.prepare("SELECT path FROM projects").all() as Array<{ path: string }>;
+    if (known.length === 0) return [];
+    const q = query.toLowerCase();
+    const tail = q.split("/").pop() || q;
+    const scored = known
+      .map((p) => {
+        const path = p.path.toLowerCase();
+        let score = 0;
+        if (path === q) score += 100;
+        if (path.endsWith("/" + tail)) score += 50;
+        if (path.includes(tail)) score += 20;
+        if (path.includes(q)) score += 10;
+        return { path: p.path, score };
+      })
+      .filter((s) => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5)
+      .map((s) => s.path);
+    return scored;
+  }
+
+  private async createBranchWatch(project: string, ref: string, expiresInHours: number): Promise<ToolCallResult> {
     if (!this.onWatchRegistered) {
       return { content: [{ type: "text", text: "Error: orchestrator callback not configured" }] };
     }
-    this.startPipelineWatch(project, ref);
+    const resolved = await this.resolveProject(project);
+    if (!resolved.ok) return resolved.errorResult;
+    const canonical = resolved.canonicalPath;
+
+    const branchCheck = await this.resolveBranch(resolved.projectId, canonical, ref);
+    if (!branchCheck.ok) return branchCheck.errorResult;
+
+    this.startPipelineWatch(canonical, ref);
     this.onWatchRegistered({
       watch_type: "pipeline-chain",
       entity_type: "pipeline",
-      entity_ref: `gitlab:${project}:ref:${ref}`,
-      correlation_key: `gitlab:${project}:ref:${ref}`,
+      entity_ref: `gitlab:${canonical}:ref:${ref}`,
+      correlation_key: `gitlab:${canonical}:ref:${ref}`,
       expires_at: Date.now() + expiresInHours * 60 * 60 * 1000,
     });
-    this.logger.info({ project, ref, expiresInHours }, "branch watch registered");
-    return { content: [{ type: "text", text: `Watching pipeline on branch "${ref}" for project ${project}. Expires in ${expiresInHours}h.` }] };
+    const note = canonical !== project ? ` (resolved from "${project}")` : "";
+    this.logger.info({ project: canonical, originalProject: project, ref, expiresInHours }, "branch watch registered");
+    return { content: [{ type: "text", text: `Watching pipeline on branch "${ref}" for project ${canonical}${note}. Expires in ${expiresInHours}h.` }] };
   }
 
   private parseGitLabProject(remoteUrl: string): string | null {
@@ -442,15 +559,16 @@ export class GitLabChannelPlugin implements ChannelPlugin {
     }
   }
 
-  private async pollPipelines() {
+  private async pollPipelines(): Promise<void> {
     await this.discoverProjects();
-    const projects = this.stmts.getProjects.all() as Array<{ id: number }>;
+    const projects = this.stmts.getProjects.all() as Array<{ id: number; path: string | null }>;
     if (projects.length === 0) return;
 
     this.logger.debug({ projects: projects.length }, "polling pipelines");
     const now = Date.now();
 
     for (const project of projects) {
+      const projectKey = project.path || String(project.id);
       try {
         const url = `${this.apiUrl}/projects/${encodeURIComponent(String(project.id))}/pipelines?per_page=10&order_by=updated_at&sort=desc`;
         const res = await nodeFetch(url, { headers: this.headers });
@@ -463,20 +581,20 @@ export class GitLabChannelPlugin implements ChannelPlugin {
           this.stmts.upsertPipeline.run(pipeline.id, String(project.id), pipeline.status, pipeline.ref, pipeline.sha, pipeline.web_url, pipeline.updated_at, now);
 
           if (oldStatus !== null && oldStatus !== pipeline.status) {
-            this.logger.info({ pipelineId: pipeline.id, ref: pipeline.ref, oldStatus, newStatus: pipeline.status }, "pipeline_status_changed event");
+            this.logger.info({ pipelineId: pipeline.id, ref: pipeline.ref, oldStatus, newStatus: pipeline.status, projectKey }, "pipeline_status_changed event");
             await this.notify({
               content: `Pipeline #${pipeline.id} on "${pipeline.ref}": ${oldStatus} → ${pipeline.status} (${pipeline.sha.slice(0, 8)})`,
               meta: {
                 event_type: "pipeline_status_changed", pipeline_id: String(pipeline.id),
                 old_status: oldStatus, new_status: pipeline.status, ref: pipeline.ref,
-                project: String(project.id), web_url: pipeline.web_url,
+                project: projectKey, project_id: String(project.id), web_url: pipeline.web_url,
               },
               orchestration: {
                 source: "gitlab",
                 event_kind: "pipeline_status_changed",
                 entity_type: "pipeline",
-                entity_ref: `gitlab:${project.id}:pipeline:${pipeline.id}`,
-                correlation_key: `gitlab:${project.id}:ref:${pipeline.ref}`,
+                entity_ref: `gitlab:${projectKey}:pipeline:${pipeline.id}`,
+                correlation_key: `gitlab:${projectKey}:ref:${pipeline.ref}`,
                 dedup_key: `gitlab:pipeline:${pipeline.id}:${pipeline.status}:${pipeline.updated_at}`,
                 importance_hint: TERMINAL_STATUSES.has(pipeline.status)
                   ? (pipeline.status === "failed" ? "high" : "normal")
