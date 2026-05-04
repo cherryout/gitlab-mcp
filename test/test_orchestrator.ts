@@ -184,8 +184,9 @@ async function run() {
   assert(summary.bySource.gitlab === 1, "summary by source: 1 gitlab");
   assert(summary.byImportance.high === 1, "summary by importance: 1 high");
 
-  // 11. Replay on resume — replays queued items AND unacked delivered-live items
-  // (since runtime never acked them, the orchestrator can't assume they were surfaced)
+  // 11. Replay on resume — replays queued items AND unacked delivered-live items.
+  // Replay does NOT ack: stdio receipt is not proof Claude saw it. Items stay
+  // unacked until the surfacing path (auto-surface or explicit ack_attention).
   console.log("\n--- Replay on Resume ---");
   const replayNotifications: Array<{ content: string; meta: Record<string, string> }> = [];
   const replayed = await orchestrator.replayOnResume(session.session_id, async (content, meta) => {
@@ -196,10 +197,17 @@ async function run() {
   assert(replayNotifications.every((n) => n.meta.replay === "true"), "all replays flagged");
 
   const pendingAfterReplay = orchestrator.listPendingDeliveries(session.session_id);
-  assert(pendingAfterReplay.length === 0, "no queued-pending after replay");
+  assert(pendingAfterReplay.length === 0, "no queued-state items after replay (promoted to delivered-live)");
 
+  // Replay again — still re-emits because items remain unacked (no harness ack on stdio).
   const replayAgain = await orchestrator.replayOnResume(session.session_id, async () => {});
-  assert(replayAgain === 0, "second replay is idempotent — items already acked");
+  assert(replayAgain === 3, `second replay still re-emits unacked items (got ${replayAgain})`);
+
+  // After bulk-ack (the auto-surface path), replay becomes a no-op.
+  const acksDone = orchestrator.ackDeliveriesBySession(session.session_id);
+  assert(acksDone === 3, `bulk ack clears all 3 items (got ${acksDone})`);
+  const replayAfterAck = await orchestrator.replayOnResume(session.session_id, async () => {});
+  assert(replayAfterAck === 0, "replay is idempotent only AFTER explicit/auto ack");
 
   // 12. Attention lifecycle
   console.log("\n--- Attention Lifecycle ---");
@@ -517,13 +525,24 @@ async function run() {
   assert(replayed3 === 1, `unacked delivered-live item resurfaces on replay (got ${replayed3})`);
   assert(livePending2.length === 1, "callback fired for the unacked-live item");
 
-  // Second replay should be a no-op: the previous replay marked it acked.
-  const replayed4 = await orch6.replayOnResume(liveSession.session_id, async () => {});
-  assert(replayed4 === 0, "replay is idempotent after ack");
+  // Replay is fire-and-forget on stdio — it does NOT ack. Surfacing API still
+  // sees the item, so the next tool-call auto-surface will show it to Claude.
+  const unackedStillThere = orch6.listUnackedDeliveredLive(liveSession.session_id);
+  assert(unackedStillThere.length === 1, "replay does not ack — item still in unacked-live list");
 
-  // Surfacing API: listUnackedDeliveredLive returns nothing now (acked).
+  // Second replay re-emits again (also without acking).
+  const replayed4 = await orch6.replayOnResume(liveSession.session_id, async () => {});
+  assert(replayed4 === 1, "replay re-emits unacked items every time, until something acks");
+
+  // Auto-surface (bulk ack via tool response) is the only path to ack.
+  const acks = orch6.ackDeliveriesBySession(liveSession.session_id);
+  assert(acks === 1, "bulk ack flips the row");
   const unackedAfter = orch6.listUnackedDeliveredLive(liveSession.session_id);
-  assert(unackedAfter.length === 0, "no unacked-live items after replay marked them acked");
+  assert(unackedAfter.length === 0, "no unacked-live items after explicit bulk ack");
+
+  // After ack, replay finally is a no-op.
+  const replayedAfterAck = await orch6.replayOnResume(liveSession.session_id, async () => {});
+  assert(replayedAfterAck === 0, "replay is idempotent only AFTER ack");
 
   // New unacked event → surfacing API returns it; ackDeliveriesBySession clears it.
   orch6.ingestEvent({

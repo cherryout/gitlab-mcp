@@ -290,6 +290,7 @@ export interface OrchestratorStmts {
   markDeliveryDelivered: Database.Statement;
   markDeliveryReplayed: Database.Statement;
   markDeliveryAcked: Database.Statement;
+  markDeliveryReEmitted: Database.Statement;
   ackDeliveryByAttention: Database.Statement;
   ackDeliveriesBySession: Database.Statement;
   listPendingBySession: Database.Statement;
@@ -395,6 +396,7 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
     markDeliveryDelivered: db.prepare("UPDATE pending_deliveries SET delivery_state = 'delivered-live', delivered_at = ? WHERE delivery_id = ?"),
     markDeliveryReplayed: db.prepare("UPDATE pending_deliveries SET delivery_state = 'replayed-on-resume', replayed_at = ?, acked_at = ? WHERE delivery_id = ?"),
     markDeliveryAcked: db.prepare("UPDATE pending_deliveries SET acked_at = ? WHERE delivery_id = ? AND acked_at IS NULL"),
+    markDeliveryReEmitted: db.prepare("UPDATE pending_deliveries SET delivery_state = 'delivered-live', delivered_at = ?, replayed_at = ? WHERE delivery_id = ?"),
     ackDeliveryByAttention: db.prepare("UPDATE pending_deliveries SET acked_at = ? WHERE attention_id = ? AND acked_at IS NULL"),
     ackDeliveriesBySession: db.prepare("UPDATE pending_deliveries SET acked_at = ? WHERE session_id = ? AND delivery_state = 'delivered-live' AND acked_at IS NULL"),
     listPendingBySession: db.prepare("SELECT * FROM pending_deliveries WHERE session_id = ? AND delivery_state = 'queued' ORDER BY queued_at ASC"),

@@ -154,12 +154,13 @@ export async function replayPendingDeliveries(
     );
   }
 
+  // Replay re-emits the MCP notification but does NOT ack: the harness's
+  // receipt of a stdio notification is not proof Claude saw it. Acking is
+  // owned by the surfacing path (auto-surface in tool response, or explicit
+  // ack_attention). Promote queued → delivered-live so listUnackedDeliveredLive
+  // sees them; bump delivered_at so they're treated as fresh for grace windows.
   for (const delivery of pending) {
-    if (delivery.delivery_state === "delivered-live") {
-      stmts.markDeliveryAcked.run(now, delivery.delivery_id);
-    } else {
-      stmts.markDeliveryReplayed.run(now, now, delivery.delivery_id);
-    }
+    stmts.markDeliveryReEmitted.run(now, now, delivery.delivery_id);
   }
 
   return pending.length;
