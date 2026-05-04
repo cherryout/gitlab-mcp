@@ -101,10 +101,33 @@ const SCHEMA = `
     delivered_at INTEGER,
     replayed_at INTEGER,
     expired_at INTEGER,
+    acked_at INTEGER,
     metadata_json TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_pd_session ON pending_deliveries(session_id);
   CREATE INDEX IF NOT EXISTS idx_pd_state ON pending_deliveries(delivery_state);
+
+  CREATE TABLE IF NOT EXISTS orchestrator_audit_log (
+    audit_id TEXT PRIMARY KEY,
+    ts INTEGER NOT NULL,
+    session_id TEXT,
+    runtime_id TEXT,
+    watch_id TEXT,
+    event_id TEXT,
+    attention_id TEXT,
+    delivery_id TEXT,
+    category TEXT NOT NULL,
+    action TEXT NOT NULL,
+    outcome TEXT,
+    detail_json TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_audit_ts ON orchestrator_audit_log(ts);
+  CREATE INDEX IF NOT EXISTS idx_audit_session ON orchestrator_audit_log(session_id, ts);
+  CREATE INDEX IF NOT EXISTS idx_audit_category ON orchestrator_audit_log(category, ts);
+  CREATE INDEX IF NOT EXISTS idx_audit_delivery ON orchestrator_audit_log(delivery_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_attention ON orchestrator_audit_log(attention_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_event ON orchestrator_audit_log(event_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_watch ON orchestrator_audit_log(watch_id);
 
   CREATE TABLE IF NOT EXISTS source_checkpoints (
     source TEXT NOT NULL,
@@ -199,6 +222,7 @@ export interface PendingDeliveryRow {
   delivered_at: number | null;
   replayed_at: number | null;
   expired_at: number | null;
+  acked_at: number | null;
   metadata_json: string | null;
 }
 
@@ -208,6 +232,21 @@ export interface CheckpointRow {
   last_cursor: string | null;
   last_seen_timestamp: number | null;
   updated_at: number;
+}
+
+export interface AuditRow {
+  audit_id: string;
+  ts: number;
+  session_id: string | null;
+  runtime_id: string | null;
+  watch_id: string | null;
+  event_id: string | null;
+  attention_id: string | null;
+  delivery_id: string | null;
+  category: string;
+  action: string;
+  outcome: string | null;
+  detail_json: string | null;
 }
 
 export interface OrchestratorStmts {
@@ -250,13 +289,25 @@ export interface OrchestratorStmts {
   updateDeliveryState: Database.Statement;
   markDeliveryDelivered: Database.Statement;
   markDeliveryReplayed: Database.Statement;
+  markDeliveryAcked: Database.Statement;
+  ackDeliveryByAttention: Database.Statement;
+  ackDeliveriesBySession: Database.Statement;
   listPendingBySession: Database.Statement;
+  findDroppedNotifications: Database.Statement;
+  listForReplayBySession: Database.Statement;
+  listUnackedDeliveredLiveBySession: Database.Statement;
   expireStaleDeliveries: Database.Statement;
   purgeOldEvents: Database.Statement;
   completeWatchesByEntity: Database.Statement;
 
   upsertCheckpoint: Database.Statement;
   getCheckpoint: Database.Statement;
+
+  insertAudit: Database.Statement;
+  listAudit: Database.Statement;
+  listAuditFiltered: Database.Statement;
+  purgeOldAudit: Database.Statement;
+  countAudit: Database.Statement;
 }
 
 export interface OrchestratorDb {
@@ -273,6 +324,12 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.exec(SCHEMA);
+
+  const cols = db.prepare("PRAGMA table_info(pending_deliveries)").all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === "acked_at")) {
+    db.exec("ALTER TABLE pending_deliveries ADD COLUMN acked_at INTEGER");
+    db.exec("CREATE INDEX IF NOT EXISTS idx_pd_acked ON pending_deliveries(session_id, acked_at)");
+  }
 
   const stmts: OrchestratorStmts = {
     getSession: db.prepare("SELECT * FROM sessions WHERE session_id = ?"),
@@ -336,8 +393,45 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
     `),
     updateDeliveryState: db.prepare("UPDATE pending_deliveries SET delivery_state = ? WHERE delivery_id = ?"),
     markDeliveryDelivered: db.prepare("UPDATE pending_deliveries SET delivery_state = 'delivered-live', delivered_at = ? WHERE delivery_id = ?"),
-    markDeliveryReplayed: db.prepare("UPDATE pending_deliveries SET delivery_state = 'replayed-on-resume', replayed_at = ? WHERE delivery_id = ?"),
+    markDeliveryReplayed: db.prepare("UPDATE pending_deliveries SET delivery_state = 'replayed-on-resume', replayed_at = ?, acked_at = ? WHERE delivery_id = ?"),
+    markDeliveryAcked: db.prepare("UPDATE pending_deliveries SET acked_at = ? WHERE delivery_id = ? AND acked_at IS NULL"),
+    ackDeliveryByAttention: db.prepare("UPDATE pending_deliveries SET acked_at = ? WHERE attention_id = ? AND acked_at IS NULL"),
+    ackDeliveriesBySession: db.prepare("UPDATE pending_deliveries SET acked_at = ? WHERE session_id = ? AND delivery_state = 'delivered-live' AND acked_at IS NULL"),
     listPendingBySession: db.prepare("SELECT * FROM pending_deliveries WHERE session_id = ? AND delivery_state = 'queued' ORDER BY queued_at ASC"),
+    findDroppedNotifications: db.prepare(`
+      SELECT
+        pd.delivery_id, pd.session_id, pd.event_id, pd.attention_id,
+        pd.delivered_at, pd.queued_at,
+        ai.summary_hint, ai.importance, ai.category as attention_category,
+        e.source, e.event_kind, e.title_hint as event_title,
+        s.session_name, s.owner, s.role
+      FROM pending_deliveries pd
+      LEFT JOIN attention_items ai ON ai.attention_id = pd.attention_id
+      LEFT JOIN events e ON e.event_id = pd.event_id
+      LEFT JOIN sessions s ON s.session_id = pd.session_id
+      WHERE pd.delivery_state = 'delivered-live'
+        AND pd.acked_at IS NULL
+        AND pd.delivered_at IS NOT NULL
+        AND pd.delivered_at <= ?
+        AND (? IS NULL OR pd.session_id = ?)
+      ORDER BY pd.delivered_at DESC
+      LIMIT ?
+    `),
+    listForReplayBySession: db.prepare(`
+      SELECT * FROM pending_deliveries
+      WHERE session_id = ?
+        AND ((delivery_state = 'queued')
+             OR (delivery_state = 'delivered-live' AND acked_at IS NULL))
+      ORDER BY queued_at ASC
+    `),
+    listUnackedDeliveredLiveBySession: db.prepare(`
+      SELECT * FROM pending_deliveries
+      WHERE session_id = ?
+        AND delivery_state = 'delivered-live'
+        AND acked_at IS NULL
+        AND delivered_at >= ?
+      ORDER BY delivered_at ASC
+    `),
     expireStaleDeliveries: db.prepare("UPDATE pending_deliveries SET delivery_state = 'expired', expired_at = ? WHERE delivery_state = 'queued' AND queued_at < ?"),
     purgeOldEvents: db.prepare("DELETE FROM events WHERE created_at < ? AND event_id NOT IN (SELECT event_id FROM attention_items) AND event_id NOT IN (SELECT event_id FROM pending_deliveries WHERE delivery_state = 'queued')"),
     completeWatchesByEntity: db.prepare("UPDATE watches SET status = 'completed', updated_at = ? WHERE entity_type = ? AND entity_ref = ? AND status = 'active'"),
@@ -348,6 +442,33 @@ export function createOrchestratorDb(dbPath?: string): OrchestratorDb {
       ON CONFLICT(source, scope_key) DO UPDATE SET last_cursor=excluded.last_cursor, last_seen_timestamp=excluded.last_seen_timestamp, updated_at=excluded.updated_at
     `),
     getCheckpoint: db.prepare("SELECT * FROM source_checkpoints WHERE source = ? AND scope_key = ?"),
+
+    insertAudit: db.prepare(`
+      INSERT INTO orchestrator_audit_log
+        (audit_id, ts, session_id, runtime_id, watch_id, event_id, attention_id, delivery_id, category, action, outcome, detail_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    listAudit: db.prepare(`
+      SELECT * FROM orchestrator_audit_log
+      WHERE ts >= ? AND ts <= ?
+      ORDER BY ts DESC
+      LIMIT ?
+    `),
+    listAuditFiltered: db.prepare(`
+      SELECT * FROM orchestrator_audit_log
+      WHERE ts >= ? AND ts <= ?
+        AND (? IS NULL OR session_id = ?)
+        AND (? IS NULL OR category = ?)
+        AND (? IS NULL OR action = ?)
+        AND (? IS NULL OR delivery_id = ?)
+        AND (? IS NULL OR attention_id = ?)
+        AND (? IS NULL OR event_id = ?)
+        AND (? IS NULL OR watch_id = ?)
+      ORDER BY ts DESC
+      LIMIT ?
+    `),
+    purgeOldAudit: db.prepare("DELETE FROM orchestrator_audit_log WHERE ts <= ?"),
+    countAudit: db.prepare("SELECT COUNT(*) as n FROM orchestrator_audit_log"),
   };
 
   return {

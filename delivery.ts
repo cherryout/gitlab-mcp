@@ -96,7 +96,7 @@ export async function replayPendingDeliveries(
   stmts: OrchestratorStmts,
   notifyFn: (content: string, meta: Record<string, string>) => Promise<void>,
 ): Promise<number> {
-  const pending = stmts.listPendingBySession.all(sessionId) as PendingDeliveryRow[];
+  const pending = stmts.listForReplayBySession.all(sessionId) as PendingDeliveryRow[];
   if (pending.length === 0) return 0;
 
   const attentionIds = [...new Set(pending.map((p) => p.attention_id).filter(Boolean))];
@@ -155,7 +155,11 @@ export async function replayPendingDeliveries(
   }
 
   for (const delivery of pending) {
-    stmts.markDeliveryReplayed.run(now, delivery.delivery_id);
+    if (delivery.delivery_state === "delivered-live") {
+      stmts.markDeliveryAcked.run(now, delivery.delivery_id);
+    } else {
+      stmts.markDeliveryReplayed.run(now, now, delivery.delivery_id);
+    }
   }
 
   return pending.length;

@@ -105,6 +105,7 @@ Orchestrator tools (session & watch management):
 - ack_attention / snooze_attention / resolve_attention: manage attention lifecycle
 - get_session_state: full session state dump
 - list_unmatched_events: events that matched no watch
+- get_audit_trail: cross-session forensic audit log — filter by session, category, action, delivery_id, attention_id, event_id, watch_id, time range. Use this to investigate any delivery/watch/runtime issue ("why didn't I get notified", "what happened to delivery X", "trace event Y end-to-end").
 
 Session is auto-managed: created on first startup, resumed on reconnect.
 Watches survive session restarts — events queue while you're away, replay on resume.
@@ -173,31 +174,96 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
+  const callStart = Date.now();
   logger.info({ tool: name }, "tool call");
+  orchestrator.audit({
+    category: "tool_call", action: "received", outcome: "success",
+    sessionId: activeSessionId,
+    detail: { tool: name, args: args || {} },
+  });
 
-  const orchResult = await handleOrchestratorToolCall(orchestrator, name, (args as Record<string, unknown>) || {}, activeSessionId!);
-  if (orchResult) {
-    if (name === "add_watch" && (args as Record<string, unknown>).watch_type === "pipeline-chain") {
-      const entityRef = (args as Record<string, unknown>).entity_ref as string;
-      const match = entityRef.match(/^gitlab:([^:]+):ref:(.+)$/);
-      if (match) {
-        const gitlabEntry = registry.get("gitlab");
-        if (gitlabEntry?.active && "startPipelineWatch" in gitlabEntry.plugin) {
-          (gitlabEntry.plugin as { startPipelineWatch: (p: string, r: string) => boolean }).startPipelineWatch(match[1], match[2]);
+  const surfaceUnacked = (result: { content: Array<{ type: "text"; text: string }>; [key: string]: unknown }) => {
+    if (!activeSessionId) return result;
+    const unacked = orchestrator.listUnackedDeliveredLive(activeSessionId);
+    if (unacked.length === 0) return result;
+
+    const attentionMap = new Map(
+      unacked
+        .map((d) => d.attention_id ? orchestrator.getAttention(d.attention_id) : null)
+        .filter((a): a is NonNullable<typeof a> => a !== null)
+        .map((a) => [a.attention_id, a]),
+    );
+
+    const lines = unacked.map((d) => {
+      const att = d.attention_id ? attentionMap.get(d.attention_id) : null;
+      const hint = att?.summary_hint || "(no summary)";
+      const importance = att?.importance || "normal";
+      return `- [${importance}] ${hint} (delivery_id=${d.delivery_id})`;
+    });
+
+    const banner =
+      `\n\n[unacked-channel-events] ${unacked.length} live notification(s) had not been surfaced before this call:\n${lines.join("\n")}\n` +
+      `(replayed because their fire-and-forget MCP notifications may have been dropped between turns)`;
+
+    orchestrator.ackDeliveriesBySession(activeSessionId);
+
+    return {
+      ...result,
+      content: [...result.content, { type: "text" as const, text: banner }],
+    };
+  };
+
+  try {
+    const orchResult = await handleOrchestratorToolCall(orchestrator, name, (args as Record<string, unknown>) || {}, activeSessionId!);
+    if (orchResult) {
+      if (name === "add_watch" && (args as Record<string, unknown>).watch_type === "pipeline-chain") {
+        const entityRef = (args as Record<string, unknown>).entity_ref as string;
+        const match = entityRef.match(/^gitlab:([^:]+):ref:(.+)$/);
+        if (match) {
+          const gitlabEntry = registry.get("gitlab");
+          if (gitlabEntry?.active && "startPipelineWatch" in gitlabEntry.plugin) {
+            (gitlabEntry.plugin as { startPipelineWatch: (p: string, r: string) => boolean }).startPipelineWatch(match[1], match[2]);
+          }
         }
       }
+      const finalResult = surfaceUnacked(orchResult);
+      orchestrator.audit({
+        category: "tool_call", action: "completed", outcome: "success",
+        sessionId: activeSessionId,
+        detail: { tool: name, source: "orchestrator", duration_ms: Date.now() - callStart },
+      });
+      return finalResult;
     }
-    return orchResult;
-  }
 
-  for (const [, entry] of registry) {
-    if (!entry.active) continue;
-    const result = await entry.plugin.handleToolCall(name, (args as Record<string, unknown>) || {});
-    if (result) return result;
-  }
+    for (const [pluginName, entry] of registry) {
+      if (!entry.active) continue;
+      const result = await entry.plugin.handleToolCall(name, (args as Record<string, unknown>) || {});
+      if (result) {
+        const finalResult = surfaceUnacked(result);
+        orchestrator.audit({
+          category: "tool_call", action: "completed", outcome: "success",
+          sessionId: activeSessionId,
+          detail: { tool: name, source: pluginName, duration_ms: Date.now() - callStart },
+        });
+        return finalResult;
+      }
+    }
 
-  logger.warn({ name }, "unknown tool");
-  throw new Error(`Unknown tool: ${name}`);
+    logger.warn({ name }, "unknown tool");
+    orchestrator.audit({
+      category: "tool_call", action: "unknown_tool", outcome: "error",
+      sessionId: activeSessionId,
+      detail: { tool: name, duration_ms: Date.now() - callStart },
+    });
+    throw new Error(`Unknown tool: ${name}`);
+  } catch (err) {
+    orchestrator.audit({
+      category: "tool_call", action: "failed", outcome: "error",
+      sessionId: activeSessionId,
+      detail: { tool: name, error: err instanceof Error ? err.message : String(err), duration_ms: Date.now() - callStart },
+    });
+    throw err;
+  }
 });
 
 // ─── Start ───────────────────────────────────────────────────────────
@@ -218,16 +284,15 @@ const runtime = orchestrator.attachRuntime(activeSessionId, undefined, "stdio");
 activeRuntimeId = runtime.runtime_id;
 logger.info({ runtimeId: activeRuntimeId }, "runtime attached");
 
-if (resumed) {
-  const pending = orchestrator.listPendingDeliveries(activeSessionId);
-  if (pending.length > 0) {
-    logger.info({ pending: pending.length }, "replaying pending deliveries");
-    await orchestrator.replayOnResume(activeSessionId, async (content, meta) => {
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: { content, meta },
-      });
+{
+  const replayCount = await orchestrator.replayOnResume(activeSessionId, async (content, meta) => {
+    await mcp.notification({
+      method: "notifications/claude/channel",
+      params: { content, meta },
     });
+  });
+  if (replayCount > 0) {
+    logger.info({ replayed: replayCount, resumed }, "deliveries replayed on attach");
   }
 }
 
@@ -242,6 +307,10 @@ const maintenanceTimer = setInterval(() => {
   maintenanceCycle++;
   if (maintenanceCycle % 60 === 0) {
     orchestrator.purgeOldEvents();
+    const purgedAudit = orchestrator.purgeOldAudit();
+    if (purgedAudit > 0) {
+      logger.info({ purged: purgedAudit }, "old audit entries purged");
+    }
   }
 }, 60_000);
 

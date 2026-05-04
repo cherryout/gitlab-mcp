@@ -184,18 +184,22 @@ async function run() {
   assert(summary.bySource.gitlab === 1, "summary by source: 1 gitlab");
   assert(summary.byImportance.high === 1, "summary by importance: 1 high");
 
-  // 11. Replay on resume
+  // 11. Replay on resume — replays queued items AND unacked delivered-live items
+  // (since runtime never acked them, the orchestrator can't assume they were surfaced)
   console.log("\n--- Replay on Resume ---");
   const replayNotifications: Array<{ content: string; meta: Record<string, string> }> = [];
   const replayed = await orchestrator.replayOnResume(session.session_id, async (content, meta) => {
     replayNotifications.push({ content, meta });
   });
-  assert(replayed === 1, "1 delivery replayed");
-  assert(replayNotifications.length === 1, "1 replay notification sent");
-  assert(replayNotifications[0].meta.replay === "true", "replay flag set");
+  assert(replayed === 3, `3 deliveries replayed (1 queued + 2 unacked-live), got ${replayed}`);
+  assert(replayNotifications.length >= 1, "at least 1 replay notification sent");
+  assert(replayNotifications.every((n) => n.meta.replay === "true"), "all replays flagged");
 
   const pendingAfterReplay = orchestrator.listPendingDeliveries(session.session_id);
-  assert(pendingAfterReplay.length === 0, "no pending after replay");
+  assert(pendingAfterReplay.length === 0, "no queued-pending after replay");
+
+  const replayAgain = await orchestrator.replayOnResume(session.session_id, async () => {});
+  assert(replayAgain === 0, "second replay is idempotent — items already acked");
 
   // 12. Attention lifecycle
   console.log("\n--- Attention Lifecycle ---");
@@ -467,6 +471,245 @@ async function run() {
   assert(crashReplayed.length === 1, "crash recovery: pending replayed on new runtime");
 
   orch5.close();
+
+  // ─── Live-delivery ack semantics (regression: silent black hole) ────
+
+  console.log("\n--- Live delivery: unacked items resurface on replay ---");
+  const orch6 = new Orchestrator({ dbPath });
+  const liveDelivered: string[] = [];
+  orch6.setNotifyCallback(async (_sid, content) => {
+    liveDelivered.push(content);
+  });
+
+  const liveSession = orch6.registerSession({ session_name: "live-ack-test", role: "main", owner: "alice" });
+  orch6.attachRuntime(liveSession.session_id);
+  orch6.addWatch({
+    session_id: liveSession.session_id,
+    watch_type: "pipeline-chain",
+    entity_type: "pipeline",
+    entity_ref: "gitlab:42:ref:int",
+  });
+
+  orch6.ingestEvent({
+    content: "Pipeline #1 on int: success",
+    meta: { event_type: "pipeline_status_changed", plugin: "gitlab" },
+    orchestration: {
+      source: "gitlab",
+      event_kind: "pipeline_status_changed",
+      entity_type: "pipeline",
+      entity_ref: "gitlab:42:ref:int",
+      dedup_key: "live-ack-test:1",
+      importance_hint: "high",
+      title_hint: "Pipeline #1 success",
+    },
+  });
+  assert(liveDelivered.length === 1, "live delivery fired once");
+
+  // Pretend the channel notification got dropped — Claude never acked it.
+  // Replay-on-attach must resurface it.
+  const livePending = orch6.listPendingDeliveries(liveSession.session_id);
+  assert(livePending.length === 0, "queued-only pending list is empty (item was delivered-live, not queued)");
+
+  const livePending2: string[] = [];
+  const replayed3 = await orch6.replayOnResume(liveSession.session_id, async (content) => {
+    livePending2.push(content);
+  });
+  assert(replayed3 === 1, `unacked delivered-live item resurfaces on replay (got ${replayed3})`);
+  assert(livePending2.length === 1, "callback fired for the unacked-live item");
+
+  // Second replay should be a no-op: the previous replay marked it acked.
+  const replayed4 = await orch6.replayOnResume(liveSession.session_id, async () => {});
+  assert(replayed4 === 0, "replay is idempotent after ack");
+
+  // Surfacing API: listUnackedDeliveredLive returns nothing now (acked).
+  const unackedAfter = orch6.listUnackedDeliveredLive(liveSession.session_id);
+  assert(unackedAfter.length === 0, "no unacked-live items after replay marked them acked");
+
+  // New unacked event → surfacing API returns it; ackDeliveriesBySession clears it.
+  orch6.ingestEvent({
+    content: "Pipeline #2 on int: failed",
+    meta: { event_type: "pipeline_status_changed", plugin: "gitlab" },
+    orchestration: {
+      source: "gitlab",
+      event_kind: "pipeline_status_changed",
+      entity_type: "pipeline",
+      entity_ref: "gitlab:42:ref:int",
+      dedup_key: "live-ack-test:2",
+      importance_hint: "high",
+      title_hint: "Pipeline #2 failed",
+    },
+  });
+  const unacked2 = orch6.listUnackedDeliveredLive(liveSession.session_id);
+  assert(unacked2.length === 1, "new unacked-live item surfaces");
+  const ackedCount = orch6.ackDeliveriesBySession(liveSession.session_id);
+  assert(ackedCount === 1, "bulk ack flips one row");
+  const unacked3 = orch6.listUnackedDeliveredLive(liveSession.session_id);
+  assert(unacked3.length === 0, "no unacked-live items after bulk ack");
+
+  // Per-attention ack path
+  orch6.ingestEvent({
+    content: "Pipeline #3 on int: running",
+    meta: { event_type: "pipeline_status_changed", plugin: "gitlab" },
+    orchestration: {
+      source: "gitlab",
+      event_kind: "pipeline_status_changed",
+      entity_type: "pipeline",
+      entity_ref: "gitlab:42:ref:int",
+      dedup_key: "live-ack-test:3",
+      importance_hint: "normal",
+      title_hint: "Pipeline #3 running",
+    },
+  });
+  const feed3 = orch6.listSessionFeed(liveSession.session_id, { limit: 5 });
+  const newest = feed3.find((a) => a.summary_hint === "Pipeline #3 running");
+  assert(!!newest, "found new attention via feed");
+  orch6.ackDeliveryByAttention(newest!.attention_id);
+  const unacked4 = orch6.listUnackedDeliveredLive(liveSession.session_id);
+  assert(unacked4.length === 0, "ack-by-attention clears the unacked entry");
+
+  orch6.close();
+
+  // ─── Audit log: cross-session forensics ─────────────────────────────
+
+  console.log("\n--- Audit log: full lifecycle traces ---");
+  const orch7 = new Orchestrator({ dbPath });
+  const auditDelivered: string[] = [];
+  orch7.setNotifyCallback(async (_sid, content) => { auditDelivered.push(content); });
+
+  const auditSession = orch7.registerSession({ session_name: "audit-test", role: "main", owner: "carol" });
+  orch7.attachRuntime(auditSession.session_id, undefined, "stdio");
+  const auditWatch = orch7.addWatch({
+    session_id: auditSession.session_id,
+    watch_type: "pipeline-chain",
+    entity_type: "pipeline",
+    entity_ref: "gitlab:audit:ref:int",
+  });
+
+  const auditIngest = orch7.ingestEvent({
+    content: "Pipeline #1 success",
+    meta: { event_type: "pipeline_status_changed", plugin: "gitlab" },
+    orchestration: {
+      source: "gitlab",
+      event_kind: "pipeline_status_changed",
+      entity_type: "pipeline",
+      entity_ref: "gitlab:audit:ref:int",
+      dedup_key: "audit-test:1",
+      importance_hint: "high",
+      title_hint: "Pipeline #1",
+    },
+  });
+
+  // Notify happens via fire-and-forget .then; flush microtasks before reading audit
+  await new Promise((r) => setImmediate(r));
+
+  // Session lifecycle traces
+  const sessionTrail = orch7.getAuditTrail({ category: "session" });
+  assert(sessionTrail.some((a) => a.action === "registered" && a.session_id === auditSession.session_id), "audit: session registered logged");
+
+  // Runtime trace
+  const runtimeTrail = orch7.getAuditTrail({ category: "runtime" });
+  assert(runtimeTrail.some((a) => a.action === "attached" && a.session_id === auditSession.session_id), "audit: runtime attached logged");
+
+  // Watch trace
+  const watchTrail = orch7.getAuditTrail({ category: "watch" });
+  assert(watchTrail.some((a) => a.action === "added" && a.watch_id === auditWatch.watch_id), "audit: watch added logged");
+
+  // Event trace
+  const eventTrail = orch7.getAuditTrail({ category: "event", eventId: auditIngest.eventId });
+  assert(eventTrail.some((a) => a.action === "ingested"), "audit: event ingested logged");
+
+  // Delivery trace — find the delivery decision
+  const deliveryTrail = orch7.getAuditTrail({ category: "delivery", eventId: auditIngest.eventId });
+  assert(deliveryTrail.some((a) => a.action === "decided_live" && a.outcome === "live"), "audit: live delivery decision logged");
+
+  // Attention trace
+  const attentionTrail = orch7.getAuditTrail({ category: "attention", eventId: auditIngest.eventId });
+  assert(attentionTrail.some((a) => a.action === "created"), "audit: attention created logged");
+
+  // Notify trace — should have an emit success event
+  const notifyTrail = orch7.getAuditTrail({ category: "notify", sessionId: auditSession.session_id });
+  assert(notifyTrail.some((a) => a.action === "emitted"), "audit: notify emitted logged");
+
+  // Filter combinations work — session-scoped pulls session/runtime/watch/attention/delivery/notify rows
+  const sessionScoped = orch7.getAuditTrail({ sessionId: auditSession.session_id, limit: 100 });
+  assert(sessionScoped.length >= 6, `audit: session-scoped query returns multi-category trail (got ${sessionScoped.length})`);
+  const distinctCats = new Set(sessionScoped.map((a) => a.category));
+  assert(distinctCats.has("session") && distinctCats.has("runtime") && distinctCats.has("watch") && distinctCats.has("delivery"), "audit: session filter spans multiple categories");
+
+  // Detail JSON is round-trippable
+  const ingestEntry = eventTrail.find((a) => a.action === "ingested")!;
+  const parsed = JSON.parse(ingestEntry.detail_json!);
+  assert(parsed.source === "gitlab" && parsed.event_kind === "pipeline_status_changed", "audit: detail_json has structured payload");
+
+  // Forensic flow: trace one delivery end-to-end
+  const decision = deliveryTrail.find((a) => a.action === "decided_live")!;
+  const fullDeliveryHistory = orch7.getAuditTrail({ deliveryId: decision.delivery_id! });
+  assert(fullDeliveryHistory.length >= 1, "audit: filter by delivery_id returns history");
+
+  // Replay produces a replay-category audit entry
+  await orch7.replayOnResume(auditSession.session_id, async () => {});
+  const replayTrail = orch7.getAuditTrail({ category: "replay", sessionId: auditSession.session_id });
+  assert(replayTrail.length >= 1, "audit: replay category logged");
+
+  // Ack via attention path
+  const newAttention = orch7.listSessionFeed(auditSession.session_id)[0];
+  orch7.ackDeliveryByAttention(newAttention.attention_id);
+  const ackTrail = orch7.getAuditTrail({ category: "delivery", action: "acked_by_attention" });
+  assert(ackTrail.length >= 1, "audit: ack_by_attention logged");
+
+  // findDroppedNotifications: cross-session black-hole detector
+  console.log("\n--- find_dropped_notifications: black-hole detector ---");
+  const dropSession = orch7.registerSession({ session_name: "drop-test", role: "main", owner: "dora" });
+  orch7.attachRuntime(dropSession.session_id);
+  orch7.addWatch({
+    session_id: dropSession.session_id,
+    watch_type: "pipeline-chain",
+    entity_type: "pipeline",
+    entity_ref: "gitlab:drop:ref:int",
+  });
+
+  // Live event fires; we simulate Claude never seeing it (no ack)
+  orch7.ingestEvent({
+    content: "Pipeline dropped",
+    meta: { event_type: "pipeline_status_changed", plugin: "gitlab" },
+    orchestration: {
+      source: "gitlab", event_kind: "pipeline_status_changed",
+      entity_type: "pipeline", entity_ref: "gitlab:drop:ref:int",
+      dedup_key: "drop-test:1", importance_hint: "high",
+      title_hint: "Pipeline dropped — black hole",
+    },
+  });
+
+  // grace_ms=0 lets us see it immediately
+  const dropsImmediate = orch7.findDroppedNotifications({ graceMs: 0 });
+  assert(dropsImmediate.some((d) => d.session_id === dropSession.session_id), "drop detector: cross-session sweep finds the unacked-live row");
+  const ours = dropsImmediate.find((d) => d.session_id === dropSession.session_id)!;
+  assert(ours.source === "gitlab", "drop detector: row enriched with event source");
+  assert(ours.summary_hint === "Pipeline dropped — black hole", "drop detector: row enriched with attention summary");
+  assert(ours.owner === "dora", "drop detector: row enriched with session owner");
+  assert(typeof ours.age_ms === "number" && (ours.age_ms as number) >= 0, "drop detector: age_ms computed");
+
+  // Filter by session_id
+  const dropsScoped = orch7.findDroppedNotifications({ sessionId: dropSession.session_id, graceMs: 0 });
+  assert(dropsScoped.every((d) => d.session_id === dropSession.session_id), "drop detector: session_id filter works");
+
+  // Grace period excludes too-recent drops
+  const dropsWithGrace = orch7.findDroppedNotifications({ graceMs: 60_000 });
+  assert(!dropsWithGrace.some((d) => d.session_id === dropSession.session_id), "drop detector: grace period excludes recent drops");
+
+  // Once acked, no longer reported as a drop
+  orch7.ackDeliveriesBySession(dropSession.session_id);
+  const dropsAfterAck = orch7.findDroppedNotifications({ graceMs: 0 });
+  assert(!dropsAfterAck.some((d) => d.session_id === dropSession.session_id), "drop detector: acked rows excluded");
+
+  // Purge respects retention
+  const beforePurge = orch7.countAudit();
+  assert(beforePurge > 0, "audit: rows present before purge");
+  orch7.purgeOldAudit(0);
+  const afterPurge = orch7.countAudit();
+  assert(afterPurge === 0, `audit: purge with 0 retention clears all (got ${afterPurge})`);
+
+  orch7.close();
 
   try { unlinkSync(dbPath); } catch {}
 

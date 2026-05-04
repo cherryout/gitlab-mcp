@@ -67,6 +67,48 @@ export function getOrchestratorTools(): ToolDef[] {
         },
       },
     },
+    {
+      name: "ack_attention",
+      description: "Acknowledge an attention item: marks the underlying delivery as acked, suppresses replay/auto-surface duplicates. Call this when you have processed a channel notification so the orchestrator knows it was actually surfaced.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          attention_id: { type: "string", description: "Attention ID to acknowledge" },
+        },
+        required: ["attention_id"],
+      },
+    },
+    {
+      name: "find_dropped_notifications",
+      description: "Find live notifications that were emitted to a session but never surfaced to Claude (delivered-live with no acked_at after grace period). Returns enriched rows with session, summary, source, event kind, and age. Cross-session by default; pass session_id to scope. Use this to detect black-hole drops across all orchestrator sessions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          session_id: { type: "string", description: "Filter by session (omit for cross-session sweep)" },
+          grace_ms: { type: "number", description: "Only count drops older than this (default: 60000ms = 60s)" },
+          limit: { type: "number", description: "Max rows (default 100, hard cap 1000)" },
+        },
+      },
+    },
+    {
+      name: "get_audit_trail",
+      description: "Query the cross-session orchestrator audit log. Use to investigate delivery/watch/runtime issues forensically. Filters AND together; pass any subset. Returns a chronological (newest-first) list of audit entries with category, action, outcome, related IDs, and structured detail. Categories: session, runtime, watch, event, delivery, attention, replay, tool_call, maintenance, notify.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          since: { type: "number", description: "Lower bound timestamp (ms epoch)" },
+          until: { type: "number", description: "Upper bound timestamp (ms epoch)" },
+          session_id: { type: "string", description: "Filter by session" },
+          category: { type: "string", description: "Filter by category" },
+          action: { type: "string", description: "Filter by action" },
+          delivery_id: { type: "string", description: "Filter by delivery_id" },
+          attention_id: { type: "string", description: "Filter by attention_id" },
+          event_id: { type: "string", description: "Filter by event_id" },
+          watch_id: { type: "string", description: "Filter by watch_id" },
+          limit: { type: "number", description: "Max rows (default 200, hard cap 5000)" },
+        },
+      },
+    },
   ];
 }
 
@@ -76,6 +118,14 @@ function ok(data: unknown): ToolCallResult {
 
 function err(message: string): ToolCallResult {
   return { content: [{ type: "text", text: `Error: ${message}` }] };
+}
+
+function safeParse(s: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return s;
+  }
 }
 
 export async function handleOrchestratorToolCall(
@@ -117,6 +167,42 @@ export async function handleOrchestratorToolCall(
           limit: args.limit as number | undefined,
           since: args.since as number | undefined,
         }));
+
+      case "ack_attention": {
+        const attentionId = args.attention_id as string;
+        orchestrator.ackAttention(attentionId);
+        orchestrator.ackDeliveryByAttention(attentionId);
+        return ok({ status: "acked", attention_id: attentionId });
+      }
+
+      case "find_dropped_notifications": {
+        const items = orchestrator.findDroppedNotifications({
+          sessionId: args.session_id as string | undefined,
+          graceMs: args.grace_ms as number | undefined,
+          limit: args.limit as number | undefined,
+        });
+        return ok({ count: items.length, items });
+      }
+
+      case "get_audit_trail": {
+        const trail = orchestrator.getAuditTrail({
+          since: args.since as number | undefined,
+          until: args.until as number | undefined,
+          sessionId: args.session_id as string | undefined,
+          category: args.category as string | undefined,
+          action: args.action as string | undefined,
+          deliveryId: args.delivery_id as string | undefined,
+          attentionId: args.attention_id as string | undefined,
+          eventId: args.event_id as string | undefined,
+          watchId: args.watch_id as string | undefined,
+          limit: args.limit as number | undefined,
+        });
+        const parsed = trail.map((row) => ({
+          ...row,
+          detail: row.detail_json ? safeParse(row.detail_json) : null,
+        }));
+        return ok({ count: parsed.length, total: orchestrator.countAudit(), items: parsed });
+      }
 
       default:
         return null;
