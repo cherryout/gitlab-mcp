@@ -10,3 +10,7 @@ coverage/
 # ai
 .opencode*
 .aider*
+
+# python
+__pycache__/
+*.pyc

@@ -1,8 +1,0 @@
-FROM jenkins/jenkins:2.492.1-lts-jdk17
-
-COPY jenkins-plugins.txt /usr/share/jenkins/ref/plugins.txt
-RUN jenkins-plugin-cli --plugin-file /usr/share/jenkins/ref/plugins.txt
-
-COPY jenkins-init.groovy /usr/share/jenkins/ref/init.groovy.d/init.groovy
-
-ENV JAVA_OPTS="-Djenkins.install.runSetupWizard=false -Dhudson.security.csrf.GlobalCrumbIssuerConfiguration.DISABLE_CSRF_PROTECTION=true"
